@@ -444,46 +444,57 @@ Bild in der **Test-Upload**-Sektion hochladen — gut für Tests oder als Notfal
 # ════════════════════════════════════════════════════════════════════════════════
 with tab_test:
     st.header("🧪 Test-Upload")
-    st.info("Hier kannst du ein Bild manuell hochladen um zu testen, ob das Modell korrekt erkennt ob der Mülleimer voll ist.")
+    st.info("Lade ein Bild hoch, um den Füllstand eines Mülleimers zu testen.")
 
-    cameras = st.session_state.cameras
-    if not cameras:
-        st.warning("Zuerst mindestens eine Kamera unter **Kameras verwalten** anlegen.")
-    else:
-        cam_options = {v["name"]: k for k, v in cameras.items()}
-        selected_name = st.selectbox("Kamera auswählen", list(cam_options.keys()))
-        selected_id = cam_options[selected_name]
+    # ── Bild-Upload ──────────────────────────────────────────────────────────
+    uploaded_file = st.file_uploader(
+        "Wähle ein Bild aus (JPG/PNG)",
+        type=["jpg", "jpeg", "png"],
+        accept_multiple_files=False,
+        key="test_uploader"
+    )
 
-        uploaded = st.file_uploader("Bild hochladen (JPG / PNG)", type=["jpg", "jpeg", "png"])
+    if uploaded_file:
+        img = Image.open(uploaded_file)
+        st.image(img, caption="Hochgeladenes Bild", use_column_width=True)
 
-        if uploaded:
-            img = Image.open(uploaded)
-            st.image(img, caption="Hochgeladenes Bild", use_column_width=True)
+        # ── KI-Analyse ───────────────────────────────────────────────────────
+        if model:
+            label, conf = predict(model, labels, img)
+            full = is_full(label) and conf >= threshold
+            icon = "🔴" if full else "🟢"
+            
+            st.markdown("### 🔍 Analyseergebnis")
+            st.metric("Erkennung", f"{icon} {label}", f"{conf*100:.1f}% Konfidenz")
+            
+            if full:
+                st.error("⚠️ Mülleimer ist **voll**!")
+            else:
+                st.success("✅ Mülleimer ist **nicht voll**.")
+        else:
+            st.warning("Kein Modell geladen – Analyse nicht möglich.")
 
-            col1, col2 = st.columns(2)
+        # ── Optional: Speichern auf GitHub ───────────────────────────────────
+        if github_ok and GITHUB_REPO:
+            st.markdown("---")
+            st.markdown("### 📤 Auf GitHub speichern")
+            
+            cameras = st.session_state.cameras
+            if cameras:
+                cam_options = {v["name"]: k for k, v in cameras.items()}
+                selected_name = st.selectbox(
+                    "Kamera auswählen (für Speicherort)",
+                    list(cam_options.keys())
+                )
+                selected_id = cam_options[selected_name]
 
-            with col1:
-                if model:
-                    label, conf = predict(model, labels, img)
-                    full = is_full(label) and conf >= threshold
-                    icon = "🔴" if full else "🟢"
-                    st.metric("KI-Ergebnis", f"{icon} {label}", f"{conf*100:.1f}% Konfidenz")
-                    if full:
-                        st.error("⚠️ Mülleimer als **voll** erkannt!")
+                if st.button("Bild auf GitHub speichern"):
+                    buf = BytesIO()
+                    img.save(buf, format="JPEG")
+                    ok = save_image_to_github(selected_id, buf.getvalue(), "jpg")
+                    if ok:
+                        st.success("✅ Bild erfolgreich gespeichert!")
                     else:
-                        st.success("✅ Mülleimer **nicht voll**.")
-                else:
-                    st.warning("Kein Modell geladen — nur Upload möglich.")
-
-            with col2:
-                if github_ok:
-                    if st.button("📤 Als letztes Bild für diese Kamera speichern"):
-                        buf = BytesIO()
-                        img.save(buf, format="JPEG")
-                        ok = save_image_to_github(selected_id, buf.getvalue(), "jpg")
-                        if ok:
-                            st.success("Bild auf GitHub gespeichert!")
-                        else:
-                            st.error("Fehler beim Speichern auf GitHub.")
-                else:
-                    st.warning("GitHub nicht konfiguriert — Speichern nicht möglich.")
+                        st.error("❌ Fehler beim Speichern auf GitHub.")
+            else:
+                st.warning("Keine Kameras definiert – bitte zuerst unter **Kameras verwalten** anlegen.")
