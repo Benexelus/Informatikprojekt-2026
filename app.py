@@ -498,11 +498,16 @@ with tab_test:
                         st.error("❌ Fehler beim Speichern auf GitHub.")
             else:
                 st.warning("Keine Kameras definiert – bitte zuerst unter **Kameras verwalten** anlegen.")
-
-tab_quicktest = st.tabs(["📺 Monitor", "📷 Kameras", "📤 Upload", "🔍 Schnellanalyse"])[3]  # Index 3 = 4. Tab
+tab_monitor, tab_cameras, tab_test, tab_quicktest = st.tabs([
+       "📺 Monitor", "📷 Kameras", "📤 Test-Upload", "🔍 Schnelltest"
+   ])
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 4 — SCHNELLTEST (VERBESSERT)
+# ════════════════════════════════════════════════════════════════════════════════
+tab_quicktest = st.tabs(["📺 Monitor", "📷 Kameras", "📤 Test-Upload", "🔍 Schnelltest"])[3]  # Index 3 = 4. Reiter
 
 with tab_quicktest:
-    st.header("🔍 Schnellanalyse")
+    st.header("🔍 Schnelltest")
     st.markdown("""
     <style>
     .quicktest-card {
@@ -523,32 +528,34 @@ with tab_quicktest:
     """, unsafe_allow_html=True)
 
     # Bild-Upload
-    quick_img = st.file_uploader(
+    uploaded_img = st.file_uploader(
         "Bild auswählen (JPG/PNG)", 
         type=["jpg", "jpeg", "png"],
-        key="quick_test_uploader"
+        key="quick_upload"
     )
 
-    if quick_img:
-        img = Image.open(quick_img)
-        st.image(img, use_column_width=True)
+    if uploaded_img:
+        img = Image.open(uploaded_img)
+        st.image(img, caption="Dein hochgeladenes Bild", use_column_width=True)
 
-        # KI-Analyse
+        # KI-Analyse (falls Modell geladen)
         if model:
             label, conf = predict(model, labels, img)
             full = is_full(label) and conf >= threshold
             icon = "🔴" if full else "🟢"
             
+            # Ergebnis anzeigen
+            st.markdown("### 🎯 Analyseergebnis")
             st.markdown(f"""
             <div class="quicktest-card">
-                <b>Ergebnis:</b> {icon} {label}<br>
+                <b>Erkannter Zustand:</b> {icon} {label}<br>
                 <b>Konfidenz:</b> {conf*100:.1f}%
             </div>
             """, unsafe_allow_html=True)
 
             if full:
-                st.error("⚠️ Mülleimer ist **voll**!")
+                st.error("⚠️ **Achtung:** Mülleimer ist voll!")
             else:
-                st.success("✅ Mülleimer ist **nicht voll**.")
+                st.success("✅ **Alles okay:** Mülleimer ist nicht voll.")
         else:
             st.warning("Kein Modell geladen – Analyse nicht möglich.")
