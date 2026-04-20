@@ -498,3 +498,57 @@ with tab_test:
                         st.error("❌ Fehler beim Speichern auf GitHub.")
             else:
                 st.warning("Keine Kameras definiert – bitte zuerst unter **Kameras verwalten** anlegen.")
+
+tab_quicktest = st.tabs(["📺 Monitor", "📷 Kameras", "📤 Upload", "🔍 Schnellanalyse"])[3]  # Index 3 = 4. Tab
+
+with tab_quicktest:
+    st.header("🔍 Schnellanalyse")
+    st.markdown("""
+    <style>
+    .quicktest-card {
+        border: 2px dashed #4b8df8 !important;
+        border-radius: 12px;
+        padding: 1rem;
+        background: #f5f9ff;
+        margin-bottom: 1rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="quicktest-card">
+        <b>Lade ein Bild hoch für eine sofortige Analyse:</b><br>
+        Keine Kamera oder GitHub-Verbindung erforderlich.
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Bild-Upload
+    quick_img = st.file_uploader(
+        "Bild auswählen (JPG/PNG)", 
+        type=["jpg", "jpeg", "png"],
+        key="quick_test_uploader"
+    )
+
+    if quick_img:
+        img = Image.open(quick_img)
+        st.image(img, use_column_width=True)
+
+        # KI-Analyse
+        if model:
+            label, conf = predict(model, labels, img)
+            full = is_full(label) and conf >= threshold
+            icon = "🔴" if full else "🟢"
+            
+            st.markdown(f"""
+            <div class="quicktest-card">
+                <b>Ergebnis:</b> {icon} {label}<br>
+                <b>Konfidenz:</b> {conf*100:.1f}%
+            </div>
+            """, unsafe_allow_html=True)
+
+            if full:
+                st.error("⚠️ Mülleimer ist **voll**!")
+            else:
+                st.success("✅ Mülleimer ist **nicht voll**.")
+        else:
+            st.warning("Kein Modell geladen – Analyse nicht möglich.")
