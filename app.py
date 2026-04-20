@@ -498,9 +498,7 @@ with tab_test:
                         st.error("❌ Fehler beim Speichern auf GitHub.")
             else:
                 st.warning("Keine Kameras definiert – bitte zuerst unter **Kameras verwalten** anlegen.")
-tab_monitor, tab_cameras, tab_test, tab_quicktest = st.tabs([
-       "📺 Monitor", "📷 Kameras", "📤 Test-Upload", "🔍 Schnelltest"
-   ])
+
 # ════════════════════════════════════════════════════════════════════════════════
 # TAB 4 — SCHNELLTEST (VERBESSERT)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -559,3 +557,6 @@ with tab_quicktest:
                 st.success("✅ **Alles okay:** Mülleimer ist nicht voll.")
         else:
             st.warning("Kein Modell geladen – Analyse nicht möglich.")
+tab_monitor, tab_cameras, tab_test, tab_quicktest = st.tabs([
+       "📺 Monitor", "📷 Kameras", "📤 Test-Upload", "🔍 Schnelltest"
+   ])
