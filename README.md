@@ -1,110 +1,31 @@
 # 🗑️ Trash Monitor
 
-KI-gestützte Echtzeit-Überwachung von Mülleimern mit Streamlit und Teachable Machine.
+KI-gestützte Echtzeit-Überwachung von Mülleimern — gebaut mit Streamlit und Teachable Machine.
 
 ---
 
-## Was macht diese App?
+## Einrichtung
 
-- Überwacht **mehrere Kameras gleichzeitig**
-- Erkennt automatisch, ob ein Mülleimer **voll oder nicht voll** ist
-- Zeigt eine **visuelle Warnung + Tonalarm**, wenn ein Eimer überfüllt ist
-- Überfüllte Eimer werden **groß und hervorgehoben** angezeigt
-- Aktualisiert sich automatisch alle 10–300 Sekunden
-
----
-
-## Voraussetzungen
-
-- Python 3.9 oder neuer
-- Eine Kamera (oder ein Skript, das Bilder in einen Ordner speichert)
-- Ein trainiertes [Teachable Machine](https://teachablemachine.withgoogle.com) Modell
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/DEIN_USERNAME/trash-monitor.git
-cd trash-monitor
-pip install -r requirements.txt
-streamlit run app.py
-```
-
----
-
-## Teachable Machine Modell erstellen
-
+### 1. Teachable Machine Modell
 1. Gehe zu [teachablemachine.withgoogle.com](https://teachablemachine.withgoogle.com)
-2. Wähle **Image Project → Standard Image Model**
-3. Erstelle zwei Klassen:
-   - `voll` — Fotos von überfüllten Mülleimern
-   - `nicht voll` — Fotos von leeren / halbvollen Mülleimern
-4. Trainiere das Modell (mind. 50–100 Bilder pro Klasse empfohlen)
-5. Klicke auf **Modell exportieren → Tensorflow → Keras**
-6. Lade `keras_model.h5` und `labels.txt` herunter
+2. **Image Project → Standard Image Model**
+3. Zwei Klassen anlegen: `voll` und `nicht voll`
+4. Exportieren: **Tensorflow → Keras**
+5. `keras_model.h5` und `labels.txt` in den Ordner `model/` legen und auf GitHub pushen
 
-Diese beiden Dateien lädst du dann in der App hoch (Sidebar links).
+### 2. GitHub Personal Access Token (PAT)
+1. GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens**
+2. Berechtigungen: **Contents: Read and Write**
+3. Token kopieren
 
----
+### 3. Streamlit Secrets konfigurieren
+Auf [share.streamlit.io](https://share.streamlit.io) → Deine App → **Settings → Secrets**:
 
-## Kamera einrichten
-
-### Option A: Raspberry Pi / beliebiger PC mit Kamera
-
-Erstelle ein einfaches Skript, das alle 10 Minuten ein Bild speichert:
-
-```python
-# raspberry_capture.py
-import cv2
-import time
-import os
-from datetime import datetime
-
-CAMERA_ID = 0  # 0 = erste Kamera
-SAVE_FOLDER = "/pfad/zur/trash-monitor/camera_images/cam_1"
-INTERVAL = 600  # 10 Minuten
-
-os.makedirs(SAVE_FOLDER, exist_ok=True)
-cap = cv2.VideoCapture(CAMERA_ID)
-
-while True:
-    ret, frame = cap.read()
-    if ret:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(SAVE_FOLDER, f"capture_{ts}.jpg")
-        cv2.imwrite(path, frame)
-        print(f"Bild gespeichert: {path}")
-    time.sleep(INTERVAL)
+```toml
+GITHUB_TOKEN  = "ghp_DEIN_TOKEN"
+GITHUB_REPO   = "dein-username/trash-monitor"
+GITHUB_BRANCH = "main"
 ```
-
-Starten mit:
-```bash
-python raspberry_capture.py
-```
-
-### Option B: Simulator (zum Testen)
-
-```bash
-python camera_simulator.py --camera cam_1 --source /ordner/mit/testbildern --interval 30
-```
-
----
-
-## Mehrere Kameras
-
-Für jede Kamera einen eigenen Unterordner anlegen:
-
-```
-camera_images/
-├── cam_1/    ← Kamera Eingang
-├── cam_2/    ← Kamera Parkplatz
-└── cam_3/    ← Kamera Spielplatz
-```
-
-Entweder manuell anlegen oder in der App-Sidebar unter **„Neuen Kamera-Ordner anlegen"**.
-
-Für jede Kamera ein separates Capture-Skript mit dem passenden Ordnernamen starten.
 
 ---
 
@@ -112,43 +33,75 @@ Für jede Kamera ein separates Capture-Skript mit dem passenden Ordnernamen star
 
 ```
 trash-monitor/
-├── app.py                  ← Streamlit-App (Hauptdatei)
-├── camera_simulator.py     ← Zum Testen ohne echte Kamera
+├── app.py
 ├── requirements.txt
-├── README.md
+├── cameras.json          ← wird automatisch erstellt
 ├── .streamlit/
-│   └── config.toml         ← Theme-Einstellungen
-├── model/                  ← Teachable Machine Modell (nach Upload)
-│   ├── keras_model.h5
-│   └── labels.txt
-└── camera_images/          ← Bilder der Kameras
-    ├── cam_1/
-    ├── cam_2/
-    └── cam_3/
+│   └── config.toml
+├── model/
+│   ├── keras_model.h5    ← von Teachable Machine
+│   └── labels.txt        ← von Teachable Machine
+└── camera_images/
+    └── cam_xyz/
+        └── latest.jpg    ← wird automatisch überschrieben
 ```
 
 ---
 
-## Einstellungen in der App
+## Kamera anschließen
 
-| Einstellung | Beschreibung |
-|---|---|
-| Schwellenwert | Ab welcher Konfidenz (0.5–1.0) gilt ein Eimer als voll |
-| Auto-Refresh | Wie oft die App neue Bilder prüft (10s – 5min) |
-| Modell hochladen | keras_model.h5 + labels.txt aus Teachable Machine |
+Für jede Kamera ein Skript auf dem jeweiligen Gerät (Raspberry Pi, PC, ...) starten:
+
+```python
+# capture.py
+import cv2, requests, base64, time
+
+GITHUB_TOKEN = "ghp_..."
+GITHUB_REPO  = "username/trash-monitor"
+CAM_ID       = "cam_1"         # muss mit der ID in der App übereinstimmen
+INTERVAL     = 900             # 15 Minuten
+
+def push_image(img_bytes):
+    path = f"camera_images/{CAM_ID}/latest.jpg"
+    r = requests.get(
+        f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
+        headers={"Authorization": f"token {GITHUB_TOKEN}"}
+    )
+    sha = r.json().get("sha") if r.status_code == 200 else None
+    payload = {
+        "message": f"Update {CAM_ID}",
+        "content": base64.b64encode(img_bytes).decode(),
+        "branch": "main"
+    }
+    if sha:
+        payload["sha"] = sha
+    requests.put(
+        f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
+        headers={"Authorization": f"token {GITHUB_TOKEN}"},
+        json=payload
+    )
+
+cap = cv2.VideoCapture(0)
+while True:
+    ret, frame = cap.read()
+    if ret:
+        _, buf = cv2.imencode(".jpg", frame)
+        push_image(buf.tobytes())
+        print(f"Bild hochgeladen ({CAM_ID})")
+    time.sleep(INTERVAL)
+```
 
 ---
 
-## Tipps für bessere Erkennung
+## Features
 
-- Fotografiere immer **aus der gleichen Perspektive** (Kamera fest montiert)
-- Nutze **gute Beleuchtung** — schlechtes Licht verschlechtert die Erkennung
-- Trainiere mit Bildern aus **echten Bedingungen** (Tag/Nacht, verschiedene Füllstände)
-- Mind. **80 Bilder pro Klasse** für gute Genauigkeit
-- Teste dein Modell in Teachable Machine bevor du es hochlädst
+- 📺 **Monitor-Tab** — Echtzeit-Übersicht aller Kameras, Alarm bei überfülltem Eimer
+- 📷 **Kameras verwalten** — Kameras hinzufügen/entfernen, Verbindungsanleitung
+- 🧪 **Test-Upload** — manuell ein Bild hochladen und Modell testen
+- 🔔 **Ton-Alarm** — Signalton wenn ein Eimer voll erkannt wird
+- 💾 **GitHub-Speicherung** — immer nur das letzte Bild pro Kamera, kein Vollaufen
 
 ---
 
 ## Lizenz
-
-MIT License — frei verwendbar, auch für kommerzielle Projekte.
+MIT
