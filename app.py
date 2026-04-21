@@ -7,7 +7,7 @@ import json
 from PIL import Image
 from datetime import datetime
 from io import BytesIO
-
+ 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Trash Monitor",
@@ -15,475 +15,591 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
+ 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-.alert-banner {
-    background: #fff0f0;
-    border: 2px solid #ff4b4b;
-    border-radius: 10px;
-    padding: 1rem 1.5rem;
-    margin-bottom: 1rem;
+/* Sidebar navigation buttons */
+div[data-testid="stSidebar"] .nav-btn button {
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    padding: 0.6rem 1rem;
+    font-size: 0.95rem;
+    margin-bottom: 4px;
+    cursor: pointer;
 }
+div[data-testid="stSidebar"] .nav-btn-active button {
+    background: #ff4b4b22 !important;
+    border-left: 3px solid #ff4b4b !important;
+    font-weight: 600;
+}
+ 
+/* Cards */
 .full-card {
-    border: 3px solid #ff4b4b !important;
+    border: 3px solid #ff4b4b;
     border-radius: 12px;
     padding: 1rem;
     background: #fff5f5;
-    box-shadow: 0 0 18px #ff4b4b44;
+    box-shadow: 0 0 18px #ff4b4b33;
     margin-bottom: 1rem;
+    transition: box-shadow 0.3s;
 }
 .ok-card {
-    border: 1px solid #28a745;
+    border: 1.5px solid #28a745;
     border-radius: 12px;
     padding: 1rem;
     margin-bottom: 1rem;
 }
-.no-img-card {
-    border: 1px solid #ccc;
+.idle-card {
+    border: 1.5px solid #ccc;
     border-radius: 12px;
     padding: 1rem;
     margin-bottom: 1rem;
     background: #fafafa;
 }
-.status-full  { color: #dc3545; font-weight: bold; font-size: 1.1rem; }
-.status-ok    { color: #28a745; font-weight: bold; font-size: 1.1rem; }
-.status-none  { color: #888;    font-style: italic; }
-.cam-label    { font-size: 1rem; font-weight: 600; margin-bottom: 4px; }
+.alert-banner {
+    background: #fff0f0;
+    border: 2px solid #ff4b4b;
+    border-radius: 10px;
+    padding: 1rem 1.5rem;
+    margin-bottom: 1.5rem;
+}
+.status-full  { color: #dc3545; font-weight: 700; font-size: 1rem; }
+.status-ok    { color: #28a745; font-weight: 700; font-size: 1rem; }
+.status-none  { color: #888;    font-style: italic; font-size: 0.9rem; }
+.section-title { font-size: 1.4rem; font-weight: 600; margin-bottom: 1rem; }
+ 
+/* Connection type badge */
+.conn-badge {
+    display: inline-block;
+    background: #f0f2f6;
+    border-radius: 6px;
+    padding: 2px 10px;
+    font-size: 0.8rem;
+    color: #555;
+    margin-top: 2px;
+}
 </style>
 """, unsafe_allow_html=True)
-
+ 
 # ── GitHub helpers ────────────────────────────────────────────────────────────
-GITHUB_TOKEN  = st.secrets.get("GITHUB_TOKEN", "")
-GITHUB_REPO   = st.secrets.get("GITHUB_REPO", "")   # "username/reponame"
-IMAGES_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
-IMAGES_FOLDER = "camera_images"                       # folder inside repo
-CAMERAS_FILE  = "cameras.json"                        # camera registry in repo
-
-def gh_headers():
-    return {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json",
-    }
-
-def gh_get_file(path: str):
-    """Fetch a file from GitHub. Returns (content_bytes, sha) or (None, None)."""
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}?ref={IMAGES_BRANCH}"
-    r = requests.get(url, headers=gh_headers(), timeout=10)
+def _gh_token():  return st.secrets.get("GITHUB_TOKEN", "")
+def _gh_repo():   return st.secrets.get("GITHUB_REPO", "")
+def _gh_branch(): return st.secrets.get("GITHUB_BRANCH", "main")
+def _gh_ok():     return bool(_gh_token() and _gh_repo())
+ 
+def _gh_headers():
+    return {"Authorization": f"token {_gh_token()}",
+            "Accept": "application/vnd.github.v3+json"}
+ 
+def gh_get(path):
+    url = f"https://api.github.com/repos/{_gh_repo()}/contents/{path}?ref={_gh_branch()}"
+    r = requests.get(url, headers=_gh_headers(), timeout=10)
     if r.status_code == 200:
-        data = r.json()
-        content = base64.b64decode(data["content"])
-        return content, data["sha"]
+        d = r.json()
+        return base64.b64decode(d["content"]), d["sha"]
     return None, None
-
-def gh_put_file(path: str, content_bytes: bytes, sha: str | None, message: str):
-    """Create or update a file on GitHub."""
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
-    payload = {
-        "message": message,
-        "content": base64.b64encode(content_bytes).decode(),
-        "branch": IMAGES_BRANCH,
-    }
+ 
+def gh_put(path, data: bytes, sha, msg: str):
+    url = f"https://api.github.com/repos/{_gh_repo()}/contents/{path}"
+    payload = {"message": msg,
+               "content": base64.b64encode(data).decode(),
+               "branch": _gh_branch()}
     if sha:
         payload["sha"] = sha
-    r = requests.put(url, headers=gh_headers(), json=payload, timeout=15)
+    r = requests.put(url, headers=_gh_headers(), json=payload, timeout=15)
     return r.status_code in (200, 201)
-
+ 
 def load_cameras() -> dict:
-    """Load camera registry from GitHub. Returns dict {cam_id: {name, connection, ...}}."""
-    content, _ = gh_get_file(CAMERAS_FILE)
+    content, _ = gh_get("cameras.json")
     if content:
         return json.loads(content.decode())
     return {}
-
+ 
 def save_cameras(cameras: dict):
-    """Save camera registry to GitHub."""
-    _, sha = gh_get_file(CAMERAS_FILE)
-    gh_put_file(
-        CAMERAS_FILE,
-        json.dumps(cameras, indent=2).encode(),
-        sha,
-        "Update camera registry"
-    )
-
-def save_image_to_github(cam_id: str, img_bytes: bytes, ext: str = "jpg") -> bool:
-    """Overwrite the single latest image for a camera on GitHub."""
-    path = f"{IMAGES_FOLDER}/{cam_id}/latest.{ext}"
-    _, sha = gh_get_file(path)
-    return gh_put_file(path, img_bytes, sha, f"Update image for {cam_id}")
-
-def load_image_from_github(cam_id: str) -> Image.Image | None:
-    """Load the latest image for a camera from GitHub."""
+    _, sha = gh_get("cameras.json")
+    gh_put("cameras.json",
+           json.dumps(cameras, indent=2).encode(),
+           sha, "Update camera registry")
+ 
+def save_image(cam_id: str, img_bytes: bytes):
+    path = f"camera_images/{cam_id}/latest.jpg"
+    _, sha = gh_get(path)
+    return gh_put(path, img_bytes, sha, f"Update image {cam_id}")
+ 
+def load_image(cam_id: str) -> Image.Image | None:
     for ext in ("jpg", "jpeg", "png"):
-        path = f"{IMAGES_FOLDER}/{cam_id}/latest.{ext}"
-        content, _ = gh_get_file(path)
+        content, _ = gh_get(f"camera_images/{cam_id}/latest.{ext}")
         if content:
             return Image.open(BytesIO(content))
     return None
-
-# ── Model loader ──────────────────────────────────────────────────────────────
+ 
+# ── Model ─────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    if not os.path.exists("model/keras_model.h5") or not os.path.exists("model/labels.txt"):
+    if not os.path.exists("model/keras_model.h5") or \
+       not os.path.exists("model/labels.txt"):
         return None, None
     try:
         import tensorflow as tf
-        model = tf.keras.models.load_model("model/keras_model.h5", compile=False)
+        m = tf.keras.models.load_model("model/keras_model.h5", compile=False)
         with open("model/labels.txt") as f:
-            labels = [l.strip().split(" ", 1)[-1] for l in f.readlines()]
-        return model, labels
+            lbl = [l.strip().split(" ", 1)[-1] for l in f]
+        return m, lbl
     except Exception as e:
-        st.error(f"Modell-Fehler: {e}")
         return None, None
-
+ 
 def predict(model, labels, img: Image.Image):
     img = img.convert("RGB").resize((224, 224))
     arr = np.array(img, dtype=np.float32) / 127.5 - 1.0
     arr = np.expand_dims(arr, 0)
-    preds = model.predict(arr, verbose=0)[0]
-    idx = int(np.argmax(preds))
-    return labels[idx], float(preds[idx])
-
+    p = model.predict(arr, verbose=0)[0]
+    idx = int(np.argmax(p))
+    return labels[idx], float(p[idx])
+ 
 def is_full(label: str) -> bool:
     return "voll" in label.lower() or "full" in label.lower()
-
-# ── Session state defaults ────────────────────────────────────────────────────
+ 
+def img_to_bytes(img: Image.Image) -> bytes:
+    buf = BytesIO()
+    img.save(buf, format="JPEG")
+    return buf.getvalue()
+ 
+# ── Session state ─────────────────────────────────────────────────────────────
+if "page" not in st.session_state:
+    st.session_state.page = "monitor"
 if "cameras" not in st.session_state:
-    if GITHUB_TOKEN and GITHUB_REPO:
-        st.session_state.cameras = load_cameras()
-    else:
-        st.session_state.cameras = {}
-
-if "selected_cam" not in st.session_state:
-    st.session_state.selected_cam = None
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+    st.session_state.cameras = load_cameras() if _gh_ok() else {}
+if "detail_cam" not in st.session_state:
+    st.session_state.detail_cam = None
+if "add_cam_open" not in st.session_state:
+    st.session_state.add_cam_open = False
+ 
+model, labels = load_model()
+ 
+# ── Sidebar navigation ────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🗑️ Trash Monitor")
+    st.markdown("## 🗑️ Trash Monitor")
     st.markdown("---")
-
-    github_ok = bool(GITHUB_TOKEN and GITHUB_REPO)
-    if github_ok:
-        st.success(f"✅ GitHub verbunden\n\n`{GITHUB_REPO}`")
+ 
+    pages = {
+        "monitor":  "📺  Monitor",
+        "cameras":  "📷  Kameras verwalten",
+        "test":     "🧪  Test-Upload",
+    }
+    for key, label in pages.items():
+        active = st.session_state.page == key
+        css = "nav-btn nav-btn-active" if active else "nav-btn"
+        st.markdown(f'<div class="{css}">', unsafe_allow_html=True)
+        if st.button(label, key=f"nav_{key}", use_container_width=True):
+            st.session_state.page = key
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+ 
+    st.markdown("---")
+ 
+    # Status indicators
+    st.markdown("**Status**")
+    if _gh_ok():
+        st.markdown("🟢 GitHub verbunden")
     else:
-        st.warning("⚠️ GitHub nicht konfiguriert.\nBitte Secrets setzen (siehe README).")
-
-    st.markdown("---")
-    model, labels = load_model()
+        st.markdown("🔴 GitHub nicht konfiguriert")
     if model:
-        st.success("✅ KI-Modell geladen")
+        st.markdown("🟢 KI-Modell geladen")
     else:
-        st.error("❌ Kein Modell gefunden\n\n`model/keras_model.h5` fehlt im Repo.")
-
+        st.markdown("🔴 Kein Modell gefunden")
+ 
     st.markdown("---")
-    threshold = st.slider("Konfidenz-Schwellenwert", 0.5, 1.0, 0.75, 0.05,
-                          help="Ab wann gilt ein Eimer als voll?")
-
-    st.markdown("---")
-    if st.button("🔄 Aktualisieren"):
-        st.session_state.cameras = load_cameras()
+    if st.button("🔄 Neu laden", use_container_width=True):
+        if _gh_ok():
+            st.session_state.cameras = load_cameras()
         st.rerun()
-
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_monitor, tab_cameras, tab_test = st.tabs([
-    "📺 Monitor", "📷 Kameras verwalten", "🧪 Test-Upload"
-])
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 1 — MONITOR
-# ════════════════════════════════════════════════════════════════════════════════
-with tab_monitor:
+ 
+page = st.session_state.page
+ 
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: MONITOR
+# ══════════════════════════════════════════════════════════════════════════════
+if page == "monitor":
+    st.markdown('<div class="section-title">📺 Monitor</div>', unsafe_allow_html=True)
+ 
+    threshold = st.slider("Schwellenwert (Konfidenz)", 0.5, 1.0, 0.75, 0.05,
+                          key="thresh_monitor",
+                          help="Ab wann gilt ein Eimer als voll?")
+ 
     cameras = st.session_state.cameras
-
     if not cameras:
         st.info("Noch keine Kameras verbunden. Gehe zu **Kameras verwalten**.")
         st.stop()
-
-    # ── Analyse all cameras ──────────────────────────────────────────────────
+ 
+    # Analyse
     results = []
-    for cam_id, cam_info in cameras.items():
-        img = load_image_from_github(cam_id) if github_ok else None
-        label, conf, full = None, None, False
-        if img and model:
-            label, conf = predict(model, labels, img)
-            full = is_full(label) and conf >= threshold
-        results.append({
-            "id": cam_id,
-            "name": cam_info.get("name", cam_id),
-            "connection": cam_info.get("connection", ""),
-            "img": img,
-            "label": label,
-            "conf": conf,
-            "full": full,
-        })
-
+    with st.spinner("Bilder werden geladen..."):
+        for cam_id, info in cameras.items():
+            img = load_image(cam_id) if _gh_ok() else None
+            label, conf, full = None, None, False
+            if img and model:
+                label, conf = predict(model, labels, img)
+                full = is_full(label) and conf >= threshold
+            results.append(dict(id=cam_id, name=info.get("name", cam_id),
+                                connection=info.get("connection", ""),
+                                img=img, label=label, conf=conf, full=full))
+ 
     full_cams = [r for r in results if r["full"]]
-
-    # ── Global alert ─────────────────────────────────────────────────────────
+ 
+    # Alert banner + sound
     if full_cams:
-        names = " | ".join(["📍 " + r["name"] for r in full_cams])
+        names = " &nbsp;|&nbsp; ".join(["📍 " + r["name"] for r in full_cams])
         st.markdown(
-            f'<div class="alert-banner"><h2>🚨 {len(full_cams)} Mülleimer überfüllt!</h2><p>{names}</p></div>',
-            unsafe_allow_html=True
-        )
-        # Sound
-        st.components.v1.html("""
-        <script>
-        const ctx = new AudioContext();
-        function beep(freq, dur, vol) {
-            const o = ctx.createOscillator();
-            const g = ctx.createGain();
-            o.connect(g); g.connect(ctx.destination);
-            o.frequency.value = freq;
-            g.gain.setValueAtTime(vol, ctx.currentTime);
-            g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur);
-            o.start(ctx.currentTime);
-            o.stop(ctx.currentTime + dur);
-        }
-        beep(880, 0.3, 0.4);
-        setTimeout(() => beep(880, 0.3, 0.4), 400);
-        setTimeout(() => beep(1100, 0.5, 0.5), 800);
-        </script>
-        """, height=0)
-
-    # ── Überfüllte Eimer oben groß ────────────────────────────────────────────
+            f'<div class="alert-banner"><h3>🚨 {len(full_cams)} Mülleimer überfüllt!</h3>'
+            f'<p>{names}</p></div>',
+            unsafe_allow_html=True)
+        st.components.v1.html("""<script>
+        try {
+            const ctx = new AudioContext();
+            const beep = (f,d,v,t) => {
+                const o=ctx.createOscillator(), g=ctx.createGain();
+                o.connect(g); g.connect(ctx.destination);
+                o.frequency.value=f;
+                g.gain.setValueAtTime(v, ctx.currentTime+t);
+                g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime+t+d);
+                o.start(ctx.currentTime+t); o.stop(ctx.currentTime+t+d+0.05);
+            };
+            beep(880,0.25,0.4,0); beep(880,0.25,0.4,0.35); beep(1200,0.4,0.5,0.7);
+        } catch(e) {}
+        </script>""", height=0)
+ 
+    # Überfüllte Eimer — prominent
     if full_cams:
-        st.markdown("## 🔴 Überfüllte Eimer")
+        st.markdown("### 🔴 Überfüllte Eimer")
         cols = st.columns(min(len(full_cams), 3))
         for i, r in enumerate(full_cams):
             with cols[i % 3]:
                 st.markdown('<div class="full-card">', unsafe_allow_html=True)
-                st.markdown(f'<div class="cam-label">🗑️ {r["name"]}</div>', unsafe_allow_html=True)
-                if r["img"]:
-                    st.image(r["img"], use_column_width=True)
-                st.markdown(f'<div class="status-full">🔴 {r["label"]} — {r["conf"]*100:.1f}%</div>', unsafe_allow_html=True)
+                st.markdown(f"**🗑️ {r['name']}**")
+                st.image(r["img"], use_column_width=True)
+                st.markdown(f'<div class="status-full">🔴 {r["label"]} — {r["conf"]*100:.1f}%</div>',
+                            unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
         st.markdown("---")
-
-    # ── Alle Kameras ──────────────────────────────────────────────────────────
-    st.markdown("## 📷 Alle Kameras")
+ 
+    # Alle Kameras
+    st.markdown("### 📷 Alle Kameras")
     cols = st.columns(min(len(results), 3))
     for i, r in enumerate(results):
         with cols[i % 3]:
-            card_class = "full-card" if r["full"] else ("ok-card" if r["img"] else "no-img-card")
-            st.markdown(f'<div class="{card_class}">', unsafe_allow_html=True)
-            st.markdown(f'<div class="cam-label">📍 {r["name"]}</div>', unsafe_allow_html=True)
-            st.caption(f'Verbindung: {r["connection"]}')
-
+            card = "full-card" if r["full"] else ("ok-card" if r["img"] else "idle-card")
+            st.markdown(f'<div class="{card}">', unsafe_allow_html=True)
+            st.markdown(f"**{r['name']}**")
+            st.markdown(f'<span class="conn-badge">{r["connection"]}</span>', unsafe_allow_html=True)
+ 
             if r["img"]:
-                # Clickable image → detail view
-                if st.button(f"🔍 Letztes Bild anzeigen", key=f"view_{r['id']}"):
-                    st.session_state.selected_cam = r["id"]
-
                 st.image(r["img"], use_column_width=True)
-
                 if r["label"]:
                     icon = "🔴" if r["full"] else "🟢"
-                    status_class = "status-full" if r["full"] else "status-ok"
-                    st.markdown(
-                        f'<div class="{status_class}">{icon} {r["label"]} ({r["conf"]*100:.1f}%)</div>',
-                        unsafe_allow_html=True
-                    )
+                    cls  = "status-full" if r["full"] else "status-ok"
+                    st.markdown(f'<div class="{cls}">{icon} {r["label"]} ({r["conf"]*100:.1f}%)</div>',
+                                unsafe_allow_html=True)
                 else:
-                    st.markdown('<div class="status-none">Kein Modell geladen</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="status-none">Kein Modell — Bild vorhanden</div>',
+                                unsafe_allow_html=True)
+ 
+                if st.button("🔍 Detail", key=f"detail_{r['id']}"):
+                    st.session_state.detail_cam = r["id"]
+                    st.rerun()
             else:
-                st.markdown('<div class="status-none">⏳ Noch kein Bild empfangen</div>', unsafe_allow_html=True)
-
+                st.markdown('<div class="status-none">⏳ Noch kein Bild empfangen</div>',
+                            unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
-
-    # ── Detail-Popup ──────────────────────────────────────────────────────────
-    if st.session_state.selected_cam:
-        cam_id = st.session_state.selected_cam
-        cam_info = cameras.get(cam_id, {})
-        img = load_image_from_github(cam_id)
-
-        with st.expander(f"🔍 Detail: {cam_info.get('name', cam_id)}", expanded=True):
-            if img:
-                st.image(img, caption=f"Letztes Bild von {cam_info.get('name', cam_id)}", use_column_width=True)
+ 
+    # Detail modal
+    if st.session_state.detail_cam:
+        cam_id = st.session_state.detail_cam
+        info   = cameras.get(cam_id, {})
+        st.markdown("---")
+        st.markdown(f"### 🔍 Detail: {info.get('name', cam_id)}")
+        img = load_image(cam_id)
+        if img:
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                st.image(img, use_column_width=True)
+            with c2:
+                st.markdown(f"**Kamera:** {info.get('name', cam_id)}")
+                st.markdown(f"**Verbindung:** {info.get('connection', '—')}")
+                st.markdown(f"**Hinzugefügt:** {info.get('added', '—')[:10]}")
                 if model:
-                    label, conf = predict(model, labels, img)
-                    full = is_full(label) and conf >= threshold
-                    icon = "🔴" if full else "🟢"
-                    st.metric("Ergebnis", f"{icon} {label}", f"{conf*100:.1f}% Konfidenz")
-            else:
-                st.warning("Kein Bild verfügbar.")
-            if st.button("Schließen"):
-                st.session_state.selected_cam = None
-                st.rerun()
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 2 — KAMERAS VERWALTEN
-# ════════════════════════════════════════════════════════════════════════════════
-with tab_cameras:
-    st.header("📷 Kameras verwalten")
-
-    # ── Add camera ────────────────────────────────────────────────────────────
+                    lbl, conf = predict(model, labels, img)
+                    full = is_full(lbl) and conf >= threshold
+                    st.metric("Ergebnis", f"{'🔴' if full else '🟢'} {lbl}",
+                              f"{conf*100:.1f}% Konfidenz")
+                    if full:
+                        st.error("⚠️ Überfüllt — bitte leeren!")
+                    else:
+                        st.success("✅ Nicht überfüllt")
+        else:
+            st.warning("Kein Bild verfügbar.")
+        if st.button("✖ Schließen"):
+            st.session_state.detail_cam = None
+            st.rerun()
+ 
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: KAMERAS VERWALTEN
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "cameras":
+    st.markdown('<div class="section-title">📷 Kameras verwalten</div>', unsafe_allow_html=True)
+ 
+    threshold = st.slider("Schwellenwert (Konfidenz)", 0.5, 1.0, 0.75, 0.05,
+                          key="thresh_cameras")
+ 
+    # ── Neue Kamera ───────────────────────────────────────────────────────────
     with st.expander("➕ Neue Kamera hinzufügen", expanded=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            new_name = st.text_input("Kamera-Name", placeholder="z.B. Eingang Rathaus")
-            new_id   = st.text_input("Kamera-ID (keine Leerzeichen)", placeholder="z.B. cam_rathaus")
-        with col2:
+        c1, c2 = st.columns(2)
+        with c1:
+            new_name = st.text_input("Name der Kamera", placeholder="z.B. Eingang Rathaus")
+            new_id   = st.text_input("Kamera-ID (keine Leerzeichen, keine Umlaute)",
+                                     placeholder="z.B. cam_rathaus")
+        with c2:
             conn_type = st.selectbox("Verbindungstyp", [
-                "HTTP-Server (Raspberry Pi / PC)",
-                "WLAN / lokales Netzwerk",
-                "LTE / Mobilfunk",
-                "Bluetooth (mit Relay-Skript)",
+                "Raspberry Pi (HTTP)",
+                "PC / Laptop (lokal)",
+                "ESP32-CAM (LTE / WLAN)",
+                "Smartphone (Termux)",
+                "Bluetooth Relay",
                 "Manueller Upload",
             ])
-            conn_note = st.text_input("Verbindungsdetail (optional)", placeholder="z.B. IP-Adresse, Gerätename")
-
-        if st.button("Kamera hinzufügen"):
+            conn_note = st.text_input("Zusatzinfo (optional)",
+                                      placeholder="z.B. IP-Adresse, Standort")
+ 
+        if st.button("✅ Kamera hinzufügen", type="primary"):
             if not new_name or not new_id:
-                st.error("Name und ID sind Pflichtfelder.")
+                st.error("Bitte Name und ID eingeben.")
+            elif " " in new_id:
+                st.error("Die Kamera-ID darf keine Leerzeichen enthalten.")
             elif new_id in st.session_state.cameras:
                 st.error(f"ID '{new_id}' existiert bereits.")
             else:
                 st.session_state.cameras[new_id] = {
                     "name": new_name,
-                    "connection": f"{conn_type} — {conn_note}" if conn_note else conn_type,
+                    "connection": f"{conn_type}" + (f" — {conn_note}" if conn_note else ""),
                     "added": datetime.now().isoformat(),
                 }
-                if github_ok:
-                    save_cameras(st.session_state.cameras)
-                st.success(f"Kamera '{new_name}' hinzugefügt!")
+                if _gh_ok():
+                    with st.spinner("Wird auf GitHub gespeichert..."):
+                        save_cameras(st.session_state.cameras)
+                st.success(f"✅ Kamera **{new_name}** hinzugefügt!")
                 st.rerun()
-
+ 
+    # ── Bild manuell hochladen ────────────────────────────────────────────────
+    if st.session_state.cameras:
+        st.markdown("---")
+        st.markdown("### 📤 Bild für Kamera hochladen")
+        st.caption("Manuell ein Bild einer bestehenden Kamera hochladen — z.B. als einmaliger Test.")
+ 
+        cam_opts = {v["name"]: k for k, v in st.session_state.cameras.items()}
+        sel_name = st.selectbox("Kamera wählen", list(cam_opts.keys()), key="upload_cam_select")
+        sel_id   = cam_opts[sel_name]
+        up_file  = st.file_uploader("Bild auswählen", type=["jpg", "jpeg", "png"],
+                                    key="cam_upload")
+ 
+        if up_file:
+            img = Image.open(up_file)
+            st.image(img, width=300)
+ 
+            if model:
+                lbl, conf = predict(model, labels, img)
+                full = is_full(lbl) and conf >= threshold
+                st.metric("KI-Vorschau", f"{'🔴' if full else '🟢'} {lbl}",
+                          f"{conf*100:.1f}%")
+ 
+            if st.button("📤 Hochladen & speichern", type="primary"):
+                if _gh_ok():
+                    with st.spinner("Wird auf GitHub gespeichert..."):
+                        ok = save_image(sel_id, img_to_bytes(img))
+                    if ok:
+                        st.success("✅ Bild gespeichert!")
+                    else:
+                        st.error("Fehler beim Speichern auf GitHub.")
+                else:
+                    st.warning("GitHub nicht konfiguriert — Speichern nicht möglich.")
+ 
+    # ── Verbindungsanleitung ──────────────────────────────────────────────────
     st.markdown("---")
-
-    # ── Connection guide ──────────────────────────────────────────────────────
-    with st.expander("📡 Verbindungsmöglichkeiten — Anleitung"):
+    with st.expander("📡 Verbindungsanleitung — wie schicke ich Bilder an die App?"):
         st.markdown("""
-### 1. HTTP-Server (empfohlen für Raspberry Pi / PC)
-Die Kamera läuft als Python-Skript und sendet Bilder direkt an die App.
-
+### Wie funktioniert es?
+Jede Kamera läuft als kleines Python-Skript auf ihrem Gerät. Das Skript macht alle 15–30 Minuten ein Foto und lädt es direkt auf GitHub hoch — die App liest es dann von dort.
+ 
+---
+ 
+### Option 1 — Raspberry Pi oder PC (empfohlen)
 ```python
-# capture_and_upload.py  (auf dem Raspberry Pi ausführen)
-import cv2, requests, time, base64
-from datetime import datetime
-
-CAM_ID    = "cam_rathaus"
-APP_URL   = "https://DEINE-APP.streamlit.app/upload"   # falls API aktiviert
-INTERVAL  = 900   # 15 Minuten
-
+# capture.py
+import cv2, requests, base64, time
+ 
+GITHUB_TOKEN = "ghp_DEIN_TOKEN"
+GITHUB_REPO  = "username/trash-monitor"
+CAM_ID       = "cam_1"      # muss mit der ID in der App übereinstimmen
+INTERVAL     = 900          # Sekunden (900 = 15 Minuten)
+ 
+def push(img_bytes):
+    path = f"camera_images/{CAM_ID}/latest.jpg"
+    r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
+                     headers={"Authorization": f"token {GITHUB_TOKEN}"})
+    sha = r.json().get("sha") if r.status_code == 200 else None
+    payload = {"message": f"Update {CAM_ID}",
+               "content": base64.b64encode(img_bytes).decode(),
+               "branch": "main"}
+    if sha: payload["sha"] = sha
+    requests.put(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
+                 headers={"Authorization": f"token {GITHUB_TOKEN}"}, json=payload)
+ 
 cap = cv2.VideoCapture(0)
 while True:
     ret, frame = cap.read()
     if ret:
         _, buf = cv2.imencode(".jpg", frame)
-        # Alternativ: direkt in GitHub-Ordner kopieren (bei gemeinsamem Netzwerk)
-        with open(f"camera_images/{CAM_ID}/latest.jpg", "wb") as f:
-            f.write(buf.tobytes())
+        push(buf.tobytes())
+        print("Bild hochgeladen")
     time.sleep(INTERVAL)
 ```
-
-### 2. WLAN / Netzwerklaufwerk
-Kamera-PC und App-Server im selben Netzwerk → Bilder direkt in geteilten Ordner schreiben.
-
-### 3. LTE / Mobilfunk (ESP32-CAM)
-ESP32-CAM sendet Bild per HTTP POST an einen kleinen Flask-Server, der das Bild dann auf GitHub pusht.
-
-```python
-# relay_server.py  (auf einem Server mit fester IP)
-from flask import Flask, request
-import requests, base64, json
-
-app = Flask(__name__)
-GITHUB_TOKEN = "..."
-GITHUB_REPO  = "username/trash-monitor"
-
-@app.route("/upload/<cam_id>", methods=["POST"])
-def upload(cam_id):
-    img_bytes = request.data
-    # Push to GitHub
-    path = f"camera_images/{cam_id}/latest.jpg"
-    r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
-                     headers={"Authorization": f"token {GITHUB_TOKEN}"})
-    sha = r.json().get("sha") if r.status_code == 200 else None
-    payload = {"message": f"Update {cam_id}", "content": base64.b64encode(img_bytes).decode(), "branch": "main"}
-    if sha: payload["sha"] = sha
-    requests.put(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
-                 headers={"Authorization": f"token {GITHUB_TOKEN}"}, json=payload)
-    return "ok"
-
-app.run(host="0.0.0.0", port=5000)
+ 
+---
+ 
+### Option 2 — ESP32-CAM (LTE / WLAN)
+ESP32-CAM sendet per HTTP POST an einen kleinen Relay-Server, der dann auf GitHub pusht.
+ 
+---
+ 
+### Option 3 — Smartphone (Termux / Android)
+Termux installieren → Python installieren → obiges Skript mit der Handykamera nutzen.
+ 
+```bash
+# In Termux:
+pkg install python
+pip install requests opencv-python
+python capture.py
 ```
-
-### 4. Bluetooth (mit Relay-Skript)
-Bluetooth allein reicht nicht für Internetzugang. Lösung: Smartphone als Relay.
-- ESP32-CAM → Bluetooth → Python-Skript auf Smartphone (z.B. via Termux) → GitHub API
-
-### 5. Manueller Upload
-Bild in der **Test-Upload**-Sektion hochladen — gut für Tests oder als Notfalloption.
+ 
+---
+ 
+### Option 4 — Bluetooth Relay
+Kamera sendet per Bluetooth an einen Raspberry Pi in der Nähe, der dann per WLAN auf GitHub pusht.
+ 
+---
+ 
+### Option 5 — Manueller Upload
+Kein Skript nötig — Bild direkt über die App hochladen (oben auf dieser Seite).
         """)
-
+ 
+    # ── Bestehende Kameras ────────────────────────────────────────────────────
     st.markdown("---")
-
-    # ── Existing cameras ──────────────────────────────────────────────────────
-    st.subheader("Verbundene Kameras")
+    st.markdown("### Verbundene Kameras")
     cameras = st.session_state.cameras
     if not cameras:
         st.info("Noch keine Kameras hinzugefügt.")
     else:
-        for cam_id, cam_info in list(cameras.items()):
-            col1, col2, col3 = st.columns([3, 2, 1])
-            with col1:
-                st.markdown(f"**{cam_info['name']}**  \n`{cam_id}`")
-            with col2:
-                st.caption(cam_info.get("connection", ""))
-            with col3:
-                if st.button("🗑 Entfernen", key=f"del_{cam_id}"):
+        for cam_id, info in list(cameras.items()):
+            c1, c2, c3, c4 = st.columns([3, 3, 1, 1])
+            with c1:
+                st.markdown(f"**{info['name']}**  \n`{cam_id}`")
+            with c2:
+                st.markdown(f'<span class="conn-badge">{info.get("connection","")}</span>',
+                            unsafe_allow_html=True)
+            with c3:
+                # Show last image
+                if st.button("🖼 Bild", key=f"show_{cam_id}"):
+                    st.session_state.detail_cam = cam_id
+                    st.session_state.page = "monitor"
+                    st.rerun()
+            with c4:
+                if st.button("🗑 Löschen", key=f"del_{cam_id}"):
                     del st.session_state.cameras[cam_id]
-                    if github_ok:
+                    if _gh_ok():
                         save_cameras(st.session_state.cameras)
                     st.rerun()
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 3 — TEST UPLOAD
-# ════════════════════════════════════════════════════════════════════════════════
-with tab_test:
-    st.header("🧪 Test-Upload")
-    st.info("Hier kannst du ein Bild manuell hochladen um zu testen, ob das Modell korrekt erkennt ob der Mülleimer voll ist.")
-
-    cameras = st.session_state.cameras
-    if not cameras:
-        st.warning("Zuerst mindestens eine Kamera unter **Kameras verwalten** anlegen.")
-    else:
-        cam_options = {v["name"]: k for k, v in cameras.items()}
-        selected_name = st.selectbox("Kamera auswählen", list(cam_options.keys()))
-        selected_id = cam_options[selected_name]
-
-        uploaded = st.file_uploader("Bild hochladen (JPG / PNG)", type=["jpg", "jpeg", "png"])
-
-        if uploaded:
-            img = Image.open(uploaded)
-            st.image(img, caption="Hochgeladenes Bild", use_column_width=True)
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                if model:
-                    label, conf = predict(model, labels, img)
-                    full = is_full(label) and conf >= threshold
-                    icon = "🔴" if full else "🟢"
-                    st.metric("KI-Ergebnis", f"{icon} {label}", f"{conf*100:.1f}% Konfidenz")
-                    if full:
-                        st.error("⚠️ Mülleimer als **voll** erkannt!")
+ 
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: TEST UPLOAD
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "test":
+    st.markdown('<div class="section-title">🧪 Test-Upload</div>', unsafe_allow_html=True)
+    st.markdown("Lade ein Bild hoch um zu prüfen, ob das Modell es korrekt einschätzt — ohne dass eine echte Kamera verbunden sein muss.")
+ 
+    threshold = st.slider("Schwellenwert (Konfidenz)", 0.5, 1.0, 0.75, 0.05,
+                          key="thresh_test")
+ 
+    st.markdown("---")
+ 
+    uploaded = st.file_uploader("📁 Bild hochladen (JPG / PNG)", type=["jpg", "jpeg", "png"])
+ 
+    if uploaded:
+        img = Image.open(uploaded)
+        c1, c2 = st.columns([1, 1])
+ 
+        with c1:
+            st.markdown("**Hochgeladenes Bild**")
+            st.image(img, use_column_width=True)
+ 
+        with c2:
+            st.markdown("**KI-Auswertung**")
+            if model:
+                with st.spinner("Analysiere..."):
+                    lbl, conf = predict(model, labels, img)
+                    full = is_full(lbl) and conf >= threshold
+ 
+                icon = "🔴" if full else "🟢"
+                st.metric("Ergebnis", f"{icon} {lbl}", f"{conf*100:.1f}% Konfidenz")
+ 
+                # Confidence bar
+                st.progress(conf)
+ 
+                if full:
+                    st.error("⚠️ **Überfüllt** — Dieser Mülleimer sollte geleert werden.")
+                else:
+                    st.success("✅ **Nicht überfüllt** — Alles in Ordnung.")
+ 
+                # All class probabilities
+                st.markdown("**Alle Klassen:**")
+                raw_img = img.convert("RGB").resize((224, 224))
+                arr = np.array(raw_img, dtype=np.float32) / 127.5 - 1.0
+                arr = np.expand_dims(arr, 0)
+                all_preds = model.predict(arr, verbose=0)[0]
+                for i, lbl_name in enumerate(labels):
+                    st.progress(float(all_preds[i]), text=f"{lbl_name}: {all_preds[i]*100:.1f}%")
+ 
+            else:
+                st.warning("⚠️ Kein KI-Modell gefunden.  \n"
+                           "Lege `keras_model.h5` und `labels.txt` in den `model/` Ordner im Repo.")
+ 
+            st.markdown("---")
+ 
+            # Optionally save to a camera
+            st.markdown("**Optional: Als Kamera-Bild speichern**")
+            cameras = st.session_state.cameras
+            if cameras and _gh_ok():
+                cam_opts = {v["name"]: k for k, v in cameras.items()}
+                sel = st.selectbox("Kamera wählen", list(cam_opts.keys()), key="test_cam_sel")
+                if st.button("💾 Als letztes Bild dieser Kamera speichern"):
+                    with st.spinner("Speichere..."):
+                        ok = save_image(cam_opts[sel], img_to_bytes(img))
+                    if ok:
+                        st.success(f"✅ Gespeichert für **{sel}**")
                     else:
-                        st.success("✅ Mülleimer **nicht voll**.")
-                else:
-                    st.warning("Kein Modell geladen — nur Upload möglich.")
-
-            with col2:
-                if github_ok:
-                    if st.button("📤 Als letztes Bild für diese Kamera speichern"):
-                        buf = BytesIO()
-                        img.save(buf, format="JPEG")
-                        ok = save_image_to_github(selected_id, buf.getvalue(), "jpg")
-                        if ok:
-                            st.success("Bild auf GitHub gespeichert!")
-                        else:
-                            st.error("Fehler beim Speichern auf GitHub.")
-                else:
-                    st.warning("GitHub nicht konfiguriert — Speichern nicht möglich.")
+                        st.error("Fehler beim Speichern.")
+            elif not cameras:
+                st.caption("Erst unter **Kameras verwalten** eine Kamera anlegen.")
+            else:
+                st.caption("GitHub nicht konfiguriert — Speichern nicht möglich.")
+    else:
+        # Tips when nothing uploaded yet
+        st.markdown("### 💡 Tipps für gute Testergebnisse")
+        st.markdown("""
+- Fotografiere den Mülleimer **aus der gleichen Perspektive** wie die echte Kamera
+- Achte auf **gute Beleuchtung** — schlechtes Licht verschlechtert die Erkennung deutlich
+- Teste sowohl **volle** als auch **leere** Eimer
+- Der Schwellenwert oben bestimmt, ab welcher Sicherheit ein Eimer als "voll" gilt
+- Wenn das Modell oft falsch liegt, trainiere es mit mehr Bildern nach
+        """)
