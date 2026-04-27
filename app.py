@@ -138,30 +138,39 @@ def load_image(cam_id: str) -> Image.Image | None:
     return None
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-# Exakt nach Teachable Machine Exportcode
 np.set_printoptions(suppress=True)
+
+def _find_model_path():
+    """Sucht Modelldatei, gibt (model_path, labels_path, fehler_str) zurück."""
+    if not os.path.exists("model"):
+        return None, None, "Ordner `model/` existiert nicht auf dem Server."
+    files = os.listdir("model")
+    if not files:
+        return None, None, "Ordner `model/` ist leer. Bitte `keras_model.h5` und `labels.txt` ins Repo laden."
+    model_path = None
+    for candidate in ("model/keras_model.h5", "model/keras_Model.h5"):
+        if os.path.exists(candidate):
+            model_path = candidate
+            break
+    if model_path is None:
+        return None, None, f"Keine `.h5` Datei gefunden. Vorhandene Dateien: `{files}`"
+    if not os.path.exists("model/labels.txt"):
+        return None, None, f"`labels.txt` fehlt. Vorhandene Dateien: `{files}`"
+    return model_path, "model/labels.txt", None
 
 @st.cache_resource
 def load_model():
-    if not os.path.exists("model/keras_Model.h5") or \
-       not os.path.exists("model/labels.txt"):
-        # Fallback: auch lowercase dateiname akzeptieren
-        if not os.path.exists("model/keras_model.h5") or \
-           not os.path.exists("model/labels.txt"):
-            return None, None
+    model_path, labels_path, err = _find_model_path()
+    if err:
+        return None, None, err
     try:
-        from keras.models import load_model as keras_load
-        # Großes M (keras_Model.h5) zuerst probieren, dann kleines
-        model_path = "model/keras_Model.h5" if os.path.exists("model/keras_Model.h5") \
-                     else "model/keras_model.h5"
-        m = keras_load(model_path, compile=False)
-        with open("model/labels.txt", "r") as f:
-            # Teachable Machine Format: "0 Klasse1\n1 Klasse2\n..."
+        import tensorflow as tf
+        m = tf.keras.models.load_model(model_path, compile=False)
+        with open(labels_path, "r") as f:
             lbl = f.readlines()
-        return m, lbl
+        return m, lbl, None
     except Exception as e:
-        st.error(f"Modell-Ladefehler: {e}")
-        return None, None
+        return None, None, f"Laden fehlgeschlagen: {str(e)}"
 
 def predict(model, class_names, img: Image.Image):
     """Exakt der Teachable Machine Predict-Code."""
@@ -203,7 +212,7 @@ if "detail_cam" not in st.session_state:
 if "add_cam_open" not in st.session_state:
     st.session_state.add_cam_open = False
 
-model, labels = load_model()
+model, labels, _model_err = load_model()
 
 # ── Sidebar navigation ────────────────────────────────────────────────────────
 with st.sidebar:
@@ -236,6 +245,8 @@ with st.sidebar:
         st.markdown("🟢 KI-Modell geladen")
     else:
         st.markdown("🔴 Kein Modell gefunden")
+        if _model_err:
+            st.caption(f"ℹ️ {_model_err}")
 
     st.markdown("---")
     if st.button("🔄 Neu laden", use_container_width=True):
@@ -329,7 +340,7 @@ if page == "monitor":
                     st.markdown(f'<div class="{cls}">{icon} {r["label"]} ({r["conf"]*100:.1f}%)</div>',
                                 unsafe_allow_html=True)
                 else:
-                    st.markdown('<div class="status-none">Kein Modell — Bild vorhanden</div>',
+                    st.markdown(f'<div class="status-none">⚠️ Kein Modell: {_model_err or "unbekannter Fehler"}</div>',
                                 unsafe_allow_html=True)
 
                 if st.button("🔍 Detail", key=f"detail_{r['id']}"):
@@ -593,8 +604,7 @@ elif page == "test":
                     st.progress(float(all_preds[i]), text=f"{clean}: {all_preds[i]*100:.1f}%")
 
             else:
-                st.warning("⚠️ Kein KI-Modell gefunden.  \n"
-                           "Lege `keras_model.h5` und `labels.txt` in den `model/` Ordner im Repo.")
+                st.warning(f"⚠️ Kein KI-Modell gefunden.  \n{_model_err or ''}")
 
             st.markdown("---")
 
