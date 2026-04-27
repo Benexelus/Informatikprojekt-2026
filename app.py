@@ -7,7 +7,7 @@ import json
 from PIL import Image
 from datetime import datetime
 from io import BytesIO
- 
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Trash Monitor",
@@ -15,7 +15,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
- 
+
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -36,7 +36,7 @@ div[data-testid="stSidebar"] .nav-btn-active button {
     border-left: 3px solid #ff4b4b !important;
     font-weight: 600;
 }
- 
+
 /* Cards */
 .full-card {
     border: 3px solid #ff4b4b;
@@ -71,7 +71,7 @@ div[data-testid="stSidebar"] .nav-btn-active button {
 .status-ok    { color: #28a745; font-weight: 700; font-size: 1rem; }
 .status-none  { color: #888;    font-style: italic; font-size: 0.9rem; }
 .section-title { font-size: 1.4rem; font-weight: 600; margin-bottom: 1rem; }
- 
+
 /* Connection type badge */
 .conn-badge {
     display: inline-block;
@@ -84,17 +84,17 @@ div[data-testid="stSidebar"] .nav-btn-active button {
 }
 </style>
 """, unsafe_allow_html=True)
- 
+
 # ── GitHub helpers ────────────────────────────────────────────────────────────
 def _gh_token():  return st.secrets.get("GITHUB_TOKEN", "")
 def _gh_repo():   return st.secrets.get("GITHUB_REPO", "")
 def _gh_branch(): return st.secrets.get("GITHUB_BRANCH", "main")
 def _gh_ok():     return bool(_gh_token() and _gh_repo())
- 
+
 def _gh_headers():
     return {"Authorization": f"token {_gh_token()}",
             "Accept": "application/vnd.github.v3+json"}
- 
+
 def gh_get(path):
     url = f"https://api.github.com/repos/{_gh_repo()}/contents/{path}?ref={_gh_branch()}"
     r = requests.get(url, headers=_gh_headers(), timeout=10)
@@ -102,7 +102,7 @@ def gh_get(path):
         d = r.json()
         return base64.b64decode(d["content"]), d["sha"]
     return None, None
- 
+
 def gh_put(path, data: bytes, sha, msg: str):
     url = f"https://api.github.com/repos/{_gh_repo()}/contents/{path}"
     payload = {"message": msg,
@@ -112,62 +112,87 @@ def gh_put(path, data: bytes, sha, msg: str):
         payload["sha"] = sha
     r = requests.put(url, headers=_gh_headers(), json=payload, timeout=15)
     return r.status_code in (200, 201)
- 
+
 def load_cameras() -> dict:
     content, _ = gh_get("cameras.json")
     if content:
         return json.loads(content.decode())
     return {}
- 
+
 def save_cameras(cameras: dict):
     _, sha = gh_get("cameras.json")
     gh_put("cameras.json",
            json.dumps(cameras, indent=2).encode(),
            sha, "Update camera registry")
- 
+
 def save_image(cam_id: str, img_bytes: bytes):
     path = f"camera_images/{cam_id}/latest.jpg"
     _, sha = gh_get(path)
     return gh_put(path, img_bytes, sha, f"Update image {cam_id}")
- 
+
 def load_image(cam_id: str) -> Image.Image | None:
     for ext in ("jpg", "jpeg", "png"):
         content, _ = gh_get(f"camera_images/{cam_id}/latest.{ext}")
         if content:
             return Image.open(BytesIO(content))
     return None
- 
+
 # ── Model ─────────────────────────────────────────────────────────────────────
+# Exakt nach Teachable Machine Exportcode
+np.set_printoptions(suppress=True)
+
 @st.cache_resource
 def load_model():
-    if not os.path.exists("model/keras_model.h5") or \
+    if not os.path.exists("model/keras_Model.h5") or \
        not os.path.exists("model/labels.txt"):
-        return None, None
+        # Fallback: auch lowercase dateiname akzeptieren
+        if not os.path.exists("model/keras_model.h5") or \
+           not os.path.exists("model/labels.txt"):
+            return None, None
     try:
-        import tensorflow as tf
-        m = tf.keras.models.load_model("model/keras_model.h5", compile=False)
-        with open("model/labels.txt") as f:
-            lbl = [l.strip().split(" ", 1)[-1] for l in f]
+        from keras.models import load_model as keras_load
+        # Großes M (keras_Model.h5) zuerst probieren, dann kleines
+        model_path = "model/keras_Model.h5" if os.path.exists("model/keras_Model.h5") \
+                     else "model/keras_model.h5"
+        m = keras_load(model_path, compile=False)
+        with open("model/labels.txt", "r") as f:
+            # Teachable Machine Format: "0 Klasse1\n1 Klasse2\n..."
+            lbl = f.readlines()
         return m, lbl
     except Exception as e:
+        st.error(f"Modell-Ladefehler: {e}")
         return None, None
- 
-def predict(model, labels, img: Image.Image):
-    img = img.convert("RGB").resize((224, 224))
-    arr = np.array(img, dtype=np.float32) / 127.5 - 1.0
-    arr = np.expand_dims(arr, 0)
-    p = model.predict(arr, verbose=0)[0]
-    idx = int(np.argmax(p))
-    return labels[idx], float(p[idx])
- 
+
+def predict(model, class_names, img: Image.Image):
+    """Exakt der Teachable Machine Predict-Code."""
+    from PIL import ImageOps
+    # Array vorbereiten — genau wie Teachable Machine
+    data = np.ndarray(shape=(1, 224, 224, 3), dtype=np.float32)
+    # Bild auf mindestens 224x224 skalieren, dann mittig croppen
+    image = img.convert("RGB")
+    size = (224, 224)
+    image = ImageOps.fit(image, size, Image.Resampling.LANCZOS)
+    image_array = np.asarray(image)
+    # Normalisierung exakt wie Teachable Machine
+    normalized_image_array = (image_array.astype(np.float32) / 127.5) - 1
+    data[0] = normalized_image_array
+    # Vorhersage
+    prediction = model.predict(data, verbose=0)
+    index = np.argmax(prediction)
+    class_name = class_names[index]
+    confidence_score = float(prediction[0][index])
+    # Label bereinigen: "0 voll" → "voll"
+    clean_label = class_name.strip()[2:] if len(class_name.strip()) > 2 else class_name.strip()
+    return clean_label, confidence_score, prediction[0]
+
 def is_full(label: str) -> bool:
     return "voll" in label.lower() or "full" in label.lower()
- 
+
 def img_to_bytes(img: Image.Image) -> bytes:
     buf = BytesIO()
     img.save(buf, format="JPEG")
     return buf.getvalue()
- 
+
 # ── Session state ─────────────────────────────────────────────────────────────
 if "page" not in st.session_state:
     st.session_state.page = "monitor"
@@ -177,14 +202,14 @@ if "detail_cam" not in st.session_state:
     st.session_state.detail_cam = None
 if "add_cam_open" not in st.session_state:
     st.session_state.add_cam_open = False
- 
+
 model, labels = load_model()
- 
+
 # ── Sidebar navigation ────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🗑️ Trash Monitor")
     st.markdown("---")
- 
+
     pages = {
         "monitor":  "📺  Monitor",
         "cameras":  "📷  Kameras verwalten",
@@ -198,9 +223,9 @@ with st.sidebar:
             st.session_state.page = key
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
- 
+
     st.markdown("---")
- 
+
     # Status indicators
     st.markdown("**Status**")
     if _gh_ok():
@@ -211,30 +236,30 @@ with st.sidebar:
         st.markdown("🟢 KI-Modell geladen")
     else:
         st.markdown("🔴 Kein Modell gefunden")
- 
+
     st.markdown("---")
     if st.button("🔄 Neu laden", use_container_width=True):
         if _gh_ok():
             st.session_state.cameras = load_cameras()
         st.rerun()
- 
+
 page = st.session_state.page
- 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE: MONITOR
 # ══════════════════════════════════════════════════════════════════════════════
 if page == "monitor":
     st.markdown('<div class="section-title">📺 Monitor</div>', unsafe_allow_html=True)
- 
+
     threshold = st.slider("Schwellenwert (Konfidenz)", 0.5, 1.0, 0.75, 0.05,
                           key="thresh_monitor",
                           help="Ab wann gilt ein Eimer als voll?")
- 
+
     cameras = st.session_state.cameras
     if not cameras:
         st.info("Noch keine Kameras verbunden. Gehe zu **Kameras verwalten**.")
         st.stop()
- 
+
     # Analyse
     results = []
     with st.spinner("Bilder werden geladen..."):
@@ -242,14 +267,14 @@ if page == "monitor":
             img = load_image(cam_id) if _gh_ok() else None
             label, conf, full = None, None, False
             if img and model:
-                label, conf = predict(model, labels, img)
+                label, conf, _ = predict(model, labels, img)
                 full = is_full(label) and conf >= threshold
             results.append(dict(id=cam_id, name=info.get("name", cam_id),
                                 connection=info.get("connection", ""),
                                 img=img, label=label, conf=conf, full=full))
- 
+
     full_cams = [r for r in results if r["full"]]
- 
+
     # Alert banner + sound
     if full_cams:
         names = " &nbsp;|&nbsp; ".join(["📍 " + r["name"] for r in full_cams])
@@ -271,7 +296,7 @@ if page == "monitor":
             beep(880,0.25,0.4,0); beep(880,0.25,0.4,0.35); beep(1200,0.4,0.5,0.7);
         } catch(e) {}
         </script>""", height=0)
- 
+
     # Überfüllte Eimer — prominent
     if full_cams:
         st.markdown("### 🔴 Überfüllte Eimer")
@@ -285,7 +310,7 @@ if page == "monitor":
                             unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
         st.markdown("---")
- 
+
     # Alle Kameras
     st.markdown("### 📷 Alle Kameras")
     cols = st.columns(min(len(results), 3))
@@ -295,7 +320,7 @@ if page == "monitor":
             st.markdown(f'<div class="{card}">', unsafe_allow_html=True)
             st.markdown(f"**{r['name']}**")
             st.markdown(f'<span class="conn-badge">{r["connection"]}</span>', unsafe_allow_html=True)
- 
+
             if r["img"]:
                 st.image(r["img"], use_column_width=True)
                 if r["label"]:
@@ -306,7 +331,7 @@ if page == "monitor":
                 else:
                     st.markdown('<div class="status-none">Kein Modell — Bild vorhanden</div>',
                                 unsafe_allow_html=True)
- 
+
                 if st.button("🔍 Detail", key=f"detail_{r['id']}"):
                     st.session_state.detail_cam = r["id"]
                     st.rerun()
@@ -314,7 +339,7 @@ if page == "monitor":
                 st.markdown('<div class="status-none">⏳ Noch kein Bild empfangen</div>',
                             unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
- 
+
     # Detail modal
     if st.session_state.detail_cam:
         cam_id = st.session_state.detail_cam
@@ -331,7 +356,7 @@ if page == "monitor":
                 st.markdown(f"**Verbindung:** {info.get('connection', '—')}")
                 st.markdown(f"**Hinzugefügt:** {info.get('added', '—')[:10]}")
                 if model:
-                    lbl, conf = predict(model, labels, img)
+                    lbl, conf, _ = predict(model, labels, img)
                     full = is_full(lbl) and conf >= threshold
                     st.metric("Ergebnis", f"{'🔴' if full else '🟢'} {lbl}",
                               f"{conf*100:.1f}% Konfidenz")
@@ -344,16 +369,16 @@ if page == "monitor":
         if st.button("✖ Schließen"):
             st.session_state.detail_cam = None
             st.rerun()
- 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE: KAMERAS VERWALTEN
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "cameras":
     st.markdown('<div class="section-title">📷 Kameras verwalten</div>', unsafe_allow_html=True)
- 
+
     threshold = st.slider("Schwellenwert (Konfidenz)", 0.5, 1.0, 0.75, 0.05,
                           key="thresh_cameras")
- 
+
     # ── Neue Kamera ───────────────────────────────────────────────────────────
     with st.expander("➕ Neue Kamera hinzufügen", expanded=True):
         c1, c2 = st.columns(2)
@@ -372,7 +397,7 @@ elif page == "cameras":
             ])
             conn_note = st.text_input("Zusatzinfo (optional)",
                                       placeholder="z.B. IP-Adresse, Standort")
- 
+
         if st.button("✅ Kamera hinzufügen", type="primary"):
             if not new_name or not new_id:
                 st.error("Bitte Name und ID eingeben.")
@@ -391,29 +416,29 @@ elif page == "cameras":
                         save_cameras(st.session_state.cameras)
                 st.success(f"✅ Kamera **{new_name}** hinzugefügt!")
                 st.rerun()
- 
+
     # ── Bild manuell hochladen ────────────────────────────────────────────────
     if st.session_state.cameras:
         st.markdown("---")
         st.markdown("### 📤 Bild für Kamera hochladen")
         st.caption("Manuell ein Bild einer bestehenden Kamera hochladen — z.B. als einmaliger Test.")
- 
+
         cam_opts = {v["name"]: k for k, v in st.session_state.cameras.items()}
         sel_name = st.selectbox("Kamera wählen", list(cam_opts.keys()), key="upload_cam_select")
         sel_id   = cam_opts[sel_name]
         up_file  = st.file_uploader("Bild auswählen", type=["jpg", "jpeg", "png"],
                                     key="cam_upload")
- 
+
         if up_file:
             img = Image.open(up_file)
             st.image(img, width=300)
- 
+
             if model:
-                lbl, conf = predict(model, labels, img)
+                lbl, conf, _ = predict(model, labels, img)
                 full = is_full(lbl) and conf >= threshold
                 st.metric("KI-Vorschau", f"{'🔴' if full else '🟢'} {lbl}",
                           f"{conf*100:.1f}%")
- 
+
             if st.button("📤 Hochladen & speichern", type="primary"):
                 if _gh_ok():
                     with st.spinner("Wird auf GitHub gespeichert..."):
@@ -424,26 +449,26 @@ elif page == "cameras":
                         st.error("Fehler beim Speichern auf GitHub.")
                 else:
                     st.warning("GitHub nicht konfiguriert — Speichern nicht möglich.")
- 
+
     # ── Verbindungsanleitung ──────────────────────────────────────────────────
     st.markdown("---")
     with st.expander("📡 Verbindungsanleitung — wie schicke ich Bilder an die App?"):
         st.markdown("""
 ### Wie funktioniert es?
 Jede Kamera läuft als kleines Python-Skript auf ihrem Gerät. Das Skript macht alle 15–30 Minuten ein Foto und lädt es direkt auf GitHub hoch — die App liest es dann von dort.
- 
+
 ---
- 
+
 ### Option 1 — Raspberry Pi oder PC (empfohlen)
 ```python
 # capture.py
 import cv2, requests, base64, time
- 
+
 GITHUB_TOKEN = "ghp_DEIN_TOKEN"
 GITHUB_REPO  = "username/trash-monitor"
 CAM_ID       = "cam_1"      # muss mit der ID in der App übereinstimmen
 INTERVAL     = 900          # Sekunden (900 = 15 Minuten)
- 
+
 def push(img_bytes):
     path = f"camera_images/{CAM_ID}/latest.jpg"
     r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
@@ -455,7 +480,7 @@ def push(img_bytes):
     if sha: payload["sha"] = sha
     requests.put(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
                  headers={"Authorization": f"token {GITHUB_TOKEN}"}, json=payload)
- 
+
 cap = cv2.VideoCapture(0)
 while True:
     ret, frame = cap.read()
@@ -465,35 +490,35 @@ while True:
         print("Bild hochgeladen")
     time.sleep(INTERVAL)
 ```
- 
+
 ---
- 
+
 ### Option 2 — ESP32-CAM (LTE / WLAN)
 ESP32-CAM sendet per HTTP POST an einen kleinen Relay-Server, der dann auf GitHub pusht.
- 
+
 ---
- 
+
 ### Option 3 — Smartphone (Termux / Android)
 Termux installieren → Python installieren → obiges Skript mit der Handykamera nutzen.
- 
+
 ```bash
 # In Termux:
 pkg install python
 pip install requests opencv-python
 python capture.py
 ```
- 
+
 ---
- 
+
 ### Option 4 — Bluetooth Relay
 Kamera sendet per Bluetooth an einen Raspberry Pi in der Nähe, der dann per WLAN auf GitHub pusht.
- 
+
 ---
- 
+
 ### Option 5 — Manueller Upload
 Kein Skript nötig — Bild direkt über die App hochladen (oben auf dieser Seite).
         """)
- 
+
     # ── Bestehende Kameras ────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("### Verbundene Kameras")
@@ -520,62 +545,59 @@ Kein Skript nötig — Bild direkt über die App hochladen (oben auf dieser Seit
                     if _gh_ok():
                         save_cameras(st.session_state.cameras)
                     st.rerun()
- 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE: TEST UPLOAD
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "test":
     st.markdown('<div class="section-title">🧪 Test-Upload</div>', unsafe_allow_html=True)
     st.markdown("Lade ein Bild hoch um zu prüfen, ob das Modell es korrekt einschätzt — ohne dass eine echte Kamera verbunden sein muss.")
- 
+
     threshold = st.slider("Schwellenwert (Konfidenz)", 0.5, 1.0, 0.75, 0.05,
                           key="thresh_test")
- 
+
     st.markdown("---")
- 
+
     uploaded = st.file_uploader("📁 Bild hochladen (JPG / PNG)", type=["jpg", "jpeg", "png"])
- 
+
     if uploaded:
         img = Image.open(uploaded)
         c1, c2 = st.columns([1, 1])
- 
+
         with c1:
             st.markdown("**Hochgeladenes Bild**")
             st.image(img, use_column_width=True)
- 
+
         with c2:
             st.markdown("**KI-Auswertung**")
             if model:
                 with st.spinner("Analysiere..."):
-                    lbl, conf = predict(model, labels, img)
+                    lbl, conf, all_preds = predict(model, labels, img)
                     full = is_full(lbl) and conf >= threshold
- 
+
                 icon = "🔴" if full else "🟢"
                 st.metric("Ergebnis", f"{icon} {lbl}", f"{conf*100:.1f}% Konfidenz")
- 
+
                 # Confidence bar
                 st.progress(conf)
- 
+
                 if full:
                     st.error("⚠️ **Überfüllt** — Dieser Mülleimer sollte geleert werden.")
                 else:
                     st.success("✅ **Nicht überfüllt** — Alles in Ordnung.")
- 
-                # All class probabilities
+
+                # All class probabilities — direkt aus predict(), kein zweiter model.predict() nötig
                 st.markdown("**Alle Klassen:**")
-                raw_img = img.convert("RGB").resize((224, 224))
-                arr = np.array(raw_img, dtype=np.float32) / 127.5 - 1.0
-                arr = np.expand_dims(arr, 0)
-                all_preds = model.predict(arr, verbose=0)[0]
                 for i, lbl_name in enumerate(labels):
-                    st.progress(float(all_preds[i]), text=f"{lbl_name}: {all_preds[i]*100:.1f}%")
- 
+                    clean = lbl_name.strip()[2:] if len(lbl_name.strip()) > 2 else lbl_name.strip()
+                    st.progress(float(all_preds[i]), text=f"{clean}: {all_preds[i]*100:.1f}%")
+
             else:
                 st.warning("⚠️ Kein KI-Modell gefunden.  \n"
                            "Lege `keras_model.h5` und `labels.txt` in den `model/` Ordner im Repo.")
- 
+
             st.markdown("---")
- 
+
             # Optionally save to a camera
             st.markdown("**Optional: Als Kamera-Bild speichern**")
             cameras = st.session_state.cameras
