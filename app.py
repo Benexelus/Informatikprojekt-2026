@@ -138,39 +138,54 @@ def load_image(cam_id: str) -> Image.Image | None:
     return None
 
 # ── Model ─────────────────────────────────────────────────────────────────────
+# ── Model ─────────────────────────────────────────────────────────────────────
 np.set_printoptions(suppress=True)
 
 def _find_model_path():
-    """Sucht Modelldatei, gibt (model_path, labels_path, fehler_str) zurück."""
-    if not os.path.exists("model"):
-        return None, None, "Ordner `model/` existiert nicht auf dem Server."
-    files = os.listdir("model")
-    if not files:
-        return None, None, "Ordner `model/` ist leer. Bitte `keras_model.h5` und `labels.txt` ins Repo laden."
-    model_path = None
-    for candidate in ("model/keras_model.h5", "model/keras_Model.h5"):
-        if os.path.exists(candidate):
-            model_path = candidate
-            break
-    if model_path is None:
-        return None, None, f"Keine `.h5` Datei gefunden. Vorhandene Dateien: `{files}`"
-    if not os.path.exists("model/labels.txt"):
-        return None, None, f"`labels.txt` fehlt. Vorhandene Dateien: `{files}`"
-    return model_path, "model/labels.txt", None
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    model_dir = os.path.join(base_dir, "model")
+
+    # DEBUG INFOS
+    debug_info = {
+        "base_dir": base_dir,
+        "model_dir": model_dir,
+        "model_dir_exists": os.path.exists(model_dir),
+        "files_in_base": os.listdir(base_dir) if os.path.exists(base_dir) else [],
+        "files_in_model": os.listdir(model_dir) if os.path.exists(model_dir) else []
+    }
+
+    if not os.path.exists(model_dir):
+        return None, None, "Ordner 'model/' nicht gefunden", debug_info
+
+    model_path = os.path.join(model_dir, "keras_model.h5")
+    if not os.path.exists(model_path):
+        return None, None, "keras_model.h5 fehlt", debug_info
+
+    labels_path = os.path.join(model_dir, "labels.txt")
+    if not os.path.exists(labels_path):
+        return None, None, "labels.txt fehlt", debug_info
+
+    return model_path, labels_path, None, debug_info
+
 
 @st.cache_resource
 def load_model():
-    model_path, labels_path, err = _find_model_path()
+    model_path, labels_path, err, debug_info = _find_model_path()
+
     if err:
-        return None, None, err
+        return None, None, err, debug_info
+
     try:
         import tensorflow as tf
-        m = tf.keras.models.load_model(model_path, compile=False)
+        model = tf.keras.models.load_model(model_path, compile=False)
+
         with open(labels_path, "r") as f:
-            lbl = f.readlines()
-        return m, lbl, None
+            labels = f.readlines()
+
+        return model, labels, None, debug_info
+
     except Exception as e:
-        return None, None, f"Laden fehlgeschlagen: {str(e)}"
+        return None, None, f"Laden fehlgeschlagen: {str(e)}", debug_info
 
 def predict(model, class_names, img: Image.Image):
     """Exakt der Teachable Machine Predict-Code."""
@@ -212,7 +227,7 @@ if "detail_cam" not in st.session_state:
 if "add_cam_open" not in st.session_state:
     st.session_state.add_cam_open = False
 
-model, labels, _model_err = load_model()
+model, labels, _model_err, _model_debug = load_model()
 
 # ── Sidebar navigation ────────────────────────────────────────────────────────
 with st.sidebar:
