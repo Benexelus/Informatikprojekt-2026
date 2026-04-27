@@ -1,0 +1,2 @@
+0 Mülleimer zu voll
+1 Mülleimer nicht zu voll
