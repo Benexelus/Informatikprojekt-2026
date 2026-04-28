@@ -1,107 +1,51 @@
-# 🗑️ Trash Monitor
+# Trash Monitor - Mülleimer Überwachungssystem
 
-KI-gestützte Echtzeit-Überwachung von Mülleimern — gebaut mit Streamlit und Teachable Machine.
+## Setup
 
----
+### 1. GitHub Token erstellen
+- Gehe zu https://github.com/settings/tokens
+- Erstelle einen neuen Personal Access Token (Classic)
+- Gib ihm die Berechtigung `repo`
+- Kopiere den Token
 
-## Einrichtung
+### 2. Secrets konfigurieren
 
-### 1. Teachable Machine Modell
-1. Gehe zu [teachablemachine.withgoogle.com](https://teachablemachine.withgoogle.com)
-2. **Image Project → Standard Image Model**
-3. Zwei Klassen anlegen: `voll` und `nicht voll`
-4. Exportieren: **Tensorflow → Keras**
-5. `keras_model.h5` und `labels.txt` in den Ordner `model/` legen und auf GitHub pushen
-
-### 2. GitHub Personal Access Token (PAT)
-1. GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens**
-2. Berechtigungen: **Contents: Read and Write**
-3. Token kopieren
-
-### 3. Streamlit Secrets konfigurieren
-Auf [share.streamlit.io](https://share.streamlit.io) → Deine App → **Settings → Secrets**:
-
+#### Lokal (für Tests):
+Erstelle `.streamlit/secrets.toml`:
 ```toml
-GITHUB_TOKEN  = "ghp_DEIN_TOKEN"
-GITHUB_REPO   = "dein-username/trash-monitor"
+GITHUB_TOKEN = "ghp_xxxxxxxxxxxxx"
+GITHUB_REPO = "Benexelus/Informatikprojekt-2026"
 GITHUB_BRANCH = "main"
 ```
 
----
-
-## Projektstruktur
-
-```
-trash-monitor/
-├── app.py
-├── requirements.txt
-├── cameras.json          ← wird automatisch erstellt
-├── .streamlit/
-│   └── config.toml
-├── model/
-│   ├── keras_model.h5    ← von Teachable Machine
-│   └── labels.txt        ← von Teachable Machine
-└── camera_images/
-    └── cam_xyz/
-        └── latest.jpg    ← wird automatisch überschrieben
+#### Streamlit Cloud:
+Gehe zu App → Settings → Secrets und füge hinzu:
+```toml
+GITHUB_TOKEN = "ghp_xxxxxxxxxxxxx"
+GITHUB_REPO = "Benexelus/Informatikprojekt-2026"
+GITHUB_BRANCH = "main"
 ```
 
----
+### 3. Keras Modell hochladen
+1. Gehe zur App
+2. Sidebar → "🧠 Modell hochladen"
+3. Wähle deine trainierte `keras_model.h5` Datei
+4. Klick auf "💾 Modell speichern"
 
-## Kamera anschließen
-
-Für jede Kamera ein Skript auf dem jeweiligen Gerät (Raspberry Pi, PC, ...) starten:
-
-```python
-# capture.py
-import cv2, requests, base64, time
-
-GITHUB_TOKEN = "ghp_..."
-GITHUB_REPO  = "username/trash-monitor"
-CAM_ID       = "cam_1"         # muss mit der ID in der App übereinstimmen
-INTERVAL     = 900             # 15 Minuten
-
-def push_image(img_bytes):
-    path = f"camera_images/{CAM_ID}/latest.jpg"
-    r = requests.get(
-        f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
-        headers={"Authorization": f"token {GITHUB_TOKEN}"}
-    )
-    sha = r.json().get("sha") if r.status_code == 200 else None
-    payload = {
-        "message": f"Update {CAM_ID}",
-        "content": base64.b64encode(img_bytes).decode(),
-        "branch": "main"
-    }
-    if sha:
-        payload["sha"] = sha
-    requests.put(
-        f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
-        headers={"Authorization": f"token {GITHUB_TOKEN}"},
-        json=payload
-    )
-
-cap = cv2.VideoCapture(0)
-while True:
-    ret, frame = cap.read()
-    if ret:
-        _, buf = cv2.imencode(".jpg", frame)
-        push_image(buf.tobytes())
-        print(f"Bild hochgeladen ({CAM_ID})")
-    time.sleep(INTERVAL)
-```
-
----
+Die labels.txt wird NICHT überschrieben — sie bleibt im Repo stabil.
 
 ## Features
+- 📺 **Monitor**: Übersicht aller Kameras in Echtzeit
+- 📷 **Kameras verwalten**: Neue Kameras hinzufügen, Bilder hochladen
+- 🧪 **Test-Upload**: Modell testen ohne echte Kamera
 
-- 📺 **Monitor-Tab** — Echtzeit-Übersicht aller Kameras, Alarm bei überfülltem Eimer
-- 📷 **Kameras verwalten** — Kameras hinzufügen/entfernen, Verbindungsanleitung
-- 🧪 **Test-Upload** — manuell ein Bild hochladen und Modell testen
-- 🔔 **Ton-Alarm** — Signalton wenn ein Eimer voll erkannt wird
-- 💾 **GitHub-Speicherung** — immer nur das letzte Bild pro Kamera, kein Vollaufen
+## Troubleshooting
 
----
+### "GitHub nicht konfiguriert"
+→ Prüfe, dass GITHUB_TOKEN, GITHUB_REPO und GITHUB_BRANCH in secrets.toml gesetzt sind
 
-## Lizenz
-MIT
+### "Bad credentials (401)"
+→ Token ist ungültig/abgelaufen. Erstelle einen neuen unter https://github.com/settings/tokens
+
+### "model/labels.txt nicht gefunden"
+→ Die Datei `model/labels.txt` muss existieren. Sie wird automatisch erstellt, aber du kannst sie auch manuell hochladen.
