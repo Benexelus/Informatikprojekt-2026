@@ -5,11 +5,12 @@ import base64
 import requests
 import json
 import tempfile
+import time
 from PIL import Image, ImageOps
 from datetime import datetime
 from io import BytesIO
 
-# ── Page config ───────────────────────────────────────────────────────────────
+# ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Trash Monitor",
     page_icon="🗑️",
@@ -17,7 +18,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
+# ── CSS ──────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 div[data-testid="stSidebar"] .nav-btn button {
@@ -115,8 +116,8 @@ def gh_raw(path) -> bytes | None:
         return r.content
     return None
 
-def gh_put_small(path, data: bytes, sha, msg: str) -> bool:
-    """Kleine Dateien (<~50 MB) per Contents-API hochladen."""
+def gh_put_small(path, data: bytes, sha, msg: str) -> tuple[bool, str]:
+    """Kleine Dateien (<~50 MB) per Contents-API hochladen. Gibt (erfolg, fehler) zurück."""
     url = f"https://api.github.com/repos/{_gh_repo()}/contents/{path}"
     payload = {
         "message": msg,
@@ -125,12 +126,22 @@ def gh_put_small(path, data: bytes, sha, msg: str) -> bool:
     }
     if sha:
         payload["sha"] = sha
-    r = requests.put(url, headers=_gh_headers(), json=payload, timeout=60)
-    return r.status_code in (200, 201)
+    try:
+        r = requests.put(url, headers=_gh_headers(), json=payload, timeout=60)
+        if r.status_code in (200, 201):
+            return True, ""
+        try:
+            err = r.json().get("message", f"HTTP {r.status_code}")
+        except:
+            err = f"HTTP {r.status_code}"
+        return False, err
+    except Exception as e:
+        return False, str(e)
 
-def gh_put_blob(path, data: bytes, msg: str) -> bool:
+def gh_put_blob(path, data: bytes, msg: str, max_retries: int = 3) -> tuple[bool, str]:
     """
     Große Dateien über Git-Blobs-API hochladen — umgeht das Contents-API-Limit.
+    Mit automatischen Retries bei Netzwerkfehlern.
     Ablauf: create blob → get tree SHA → create tree → create commit → update ref
     """
     repo  = _gh_repo()
@@ -138,53 +149,72 @@ def gh_put_blob(path, data: bytes, msg: str) -> bool:
     base  = f"https://api.github.com/repos/{repo}"
     h     = _gh_headers()
 
-    # 1. Blob erstellen
-    r = requests.post(f"{base}/git/blobs", headers=h, json={
-        "content": base64.b64encode(data).decode(),
-        "encoding": "base64"
-    }, timeout=120)
-    if r.status_code not in (200, 201):
-        return False
-    blob_sha = r.json()["sha"]
+    for attempt in range(1, max_retries + 1):
+        try:
+            # 1. Blob erstellen
+            r = requests.post(f"{base}/git/blobs", headers=h, json={
+                "content": base64.b64encode(data).decode(),
+                "encoding": "base64"
+            }, timeout=120)
+            if r.status_code not in (200, 201):
+                return False, f"Blob-Fehler: {r.status_code} - {r.text[:100]}"
+            blob_sha = r.json()["sha"]
 
-    # 2. Aktuellen Branch-SHA holen
-    r = requests.get(f"{base}/git/ref/heads/{branch}", headers=h, timeout=10)
-    if r.status_code != 200:
-        return False
-    base_commit_sha = r.json()["object"]["sha"]
+            # 2. Aktuellen Branch-SHA holen
+            r = requests.get(f"{base}/git/ref/heads/{branch}", headers=h, timeout=10)
+            if r.status_code != 200:
+                return False, f"Branch-Fehler: {r.status_code}"
+            base_commit_sha = r.json()["object"]["sha"]
 
-    # 3. Aktuellen Tree-SHA holen
-    r = requests.get(f"{base}/git/commits/{base_commit_sha}", headers=h, timeout=10)
-    if r.status_code != 200:
-        return False
-    base_tree_sha = r.json()["tree"]["sha"]
+            # 3. Aktuellen Tree-SHA holen
+            r = requests.get(f"{base}/git/commits/{base_commit_sha}", headers=h, timeout=10)
+            if r.status_code != 200:
+                return False, f"Commit-Fehler: {r.status_code}"
+            base_tree_sha = r.json()["tree"]["sha"]
 
-    # 4. Neuen Tree erstellen
-    r = requests.post(f"{base}/git/trees", headers=h, json={
-        "base_tree": base_tree_sha,
-        "tree": [{"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}]
-    }, timeout=30)
-    if r.status_code not in (200, 201):
-        return False
-    new_tree_sha = r.json()["sha"]
+            # 4. Neuen Tree erstellen
+            r = requests.post(f"{base}/git/trees", headers=h, json={
+                "base_tree": base_tree_sha,
+                "tree": [{"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}]
+            }, timeout=30)
+            if r.status_code not in (200, 201):
+                return False, f"Tree-Fehler: {r.status_code}"
+            new_tree_sha = r.json()["sha"]
 
-    # 5. Commit erstellen
-    r = requests.post(f"{base}/git/commits", headers=h, json={
-        "message": msg,
-        "tree": new_tree_sha,
-        "parents": [base_commit_sha]
-    }, timeout=30)
-    if r.status_code not in (200, 201):
-        return False
-    new_commit_sha = r.json()["sha"]
+            # 5. Commit erstellen
+            r = requests.post(f"{base}/git/commits", headers=h, json={
+                "message": msg,
+                "tree": new_tree_sha,
+                "parents": [base_commit_sha]
+            }, timeout=30)
+            if r.status_code not in (200, 201):
+                return False, f"Commit-Create-Fehler: {r.status_code}"
+            new_commit_sha = r.json()["sha"]
 
-    # 6. Branch-Ref aktualisieren
-    r = requests.patch(f"{base}/git/refs/heads/{branch}", headers=h, json={
-        "sha": new_commit_sha
-    }, timeout=30)
-    return r.status_code in (200, 201)
+            # 6. Branch-Ref aktualisieren
+            r = requests.patch(f"{base}/git/refs/heads/{branch}", headers=h, json={
+                "sha": new_commit_sha
+            }, timeout=30)
+            if r.status_code in (200, 201):
+                return True, ""
+            return False, f"Ref-Update-Fehler: {r.status_code}"
 
-def gh_put(path, data: bytes, sha, msg: str) -> bool:
+        except requests.exceptions.Timeout:
+            if attempt < max_retries:
+                time.sleep(2 ** attempt)  # Exponentielles Backoff
+                continue
+            return False, f"Timeout nach {max_retries} Versuchen"
+        except requests.exceptions.ConnectionError:
+            if attempt < max_retries:
+                time.sleep(2 ** attempt)
+                continue
+            return False, f"Verbindungsfehler nach {max_retries} Versuchen"
+        except Exception as e:
+            return False, f"Fehler: {str(e)}"
+
+    return False, "Unbekannter Fehler"
+
+def gh_put(path, data: bytes, sha, msg: str) -> tuple[bool, str]:
     """Wählt automatisch die richtige Upload-Methode je nach Dateigröße."""
     if len(data) > 500_000:  # >500 KB → Blobs-API
         return gh_put_blob(path, data, msg)
@@ -196,13 +226,13 @@ def load_cameras() -> dict:
         return json.loads(content.decode())
     return {}
 
-def save_cameras(cameras: dict):
+def save_cameras(cameras: dict) -> tuple[bool, str]:
     _, sha = gh_get("cameras.json")
-    gh_put_small("cameras.json",
-                 json.dumps(cameras, indent=2).encode(),
-                 sha, "Update camera registry")
+    return gh_put_small("cameras.json",
+                        json.dumps(cameras, indent=2).encode(),
+                        sha, "Update camera registry")
 
-def save_image(cam_id: str, img_bytes: bytes):
+def save_image(cam_id: str, img_bytes: bytes) -> tuple[bool, str]:
     path = f"camera_images/{cam_id}/latest.jpg"
     _, sha = gh_get(path)
     return gh_put(path, img_bytes, sha, f"Update image {cam_id}")
@@ -217,21 +247,16 @@ def load_image(cam_id: str) -> Image.Image | None:
 # ── Model ─────────────────────────────────────────────────────────────────────
 np.set_printoptions(suppress=True)
 
-def _save_model_to_github(model_bytes: bytes, labels_bytes: bytes) -> tuple[bool, str]:
+def _save_model_to_github(model_bytes: bytes) -> tuple[bool, str]:
     """
-    Speichert Modell (groß) und Labels (klein) auf GitHub.
+    Speichert NUR das Modell (keras_model.h5) auf GitHub.
+    Labels bleiben unverhältnismäßig und werden NICHT überschrieben.
     Gibt (erfolg, fehlermeldung) zurück.
     """
-    # labels.txt — klein, Contents-API reicht
-    _, sha_lbl = gh_get("model/labels.txt")
-    ok_labels = gh_put_small("model/labels.txt", labels_bytes, sha_lbl, "Upload labels.txt")
-    if not ok_labels:
-        return False, "labels.txt konnte nicht gespeichert werden."
-
-    # keras_model.h5 — groß, Blobs-API verwenden
-    ok_model = gh_put_blob("model/keras_model.h5", model_bytes, "Upload keras_model.h5")
+    # keras_model.h5 — groß, Blobs-API verwenden mit Retries
+    ok_model, err_msg = gh_put_blob("model/keras_model.h5", model_bytes, "Upload keras_model.h5")
     if not ok_model:
-        return False, "keras_model.h5 konnte nicht gespeichert werden (Blobs-API fehlgeschlagen)."
+        return False, f"keras_model.h5 konnte nicht gespeichert werden: {err_msg}"
 
     return True, ""
 
@@ -300,7 +325,7 @@ def img_to_bytes(img: Image.Image) -> bytes:
     img.save(buf, format="JPEG")
     return buf.getvalue()
 
-# ── Session state ─────────────────────────────────────────────────────────────
+# ── Session state ──────────────────────────────────────────────────────────────
 if "page" not in st.session_state:
     st.session_state.page = "monitor"
 if "cameras" not in st.session_state:
@@ -310,7 +335,7 @@ if "detail_cam" not in st.session_state:
 
 model, labels, _model_err = load_model()
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🗑️ Trash Monitor")
     st.markdown("---")
@@ -341,23 +366,35 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**🧠 Modell hochladen**")
-    with st.expander("keras_model.h5 + labels.txt", expanded=not bool(model)):
-        st.caption("Modell von Teachable Machine hier hochladen — wird automatisch im Repo gespeichert.")
-        up_model  = st.file_uploader("keras_model.h5", type=["h5"],  key="sb_model")
-        up_labels = st.file_uploader("labels.txt",     type=["txt"], key="sb_labels")
-        if up_model and up_labels:
+    with st.expander("keras_model.h5", expanded=not bool(model)):
+        st.caption("**Nur das Modell hochladen** — labels.txt bleibt stabil im Repo und wird nicht überschrieben.")
+        st.caption("🎯 **Wichtig:** Stelle sicher, dass dein Modell die gleichen Klassen wie die bestehende labels.txt hat!")
+        up_model = st.file_uploader("keras_model.h5", type=["h5"], key="sb_model")
+        
+        if up_model:
+            file_size_mb = len(up_model.getvalue()) / (1024 * 1024)
+            st.info(f"📊 Dateigröße: {file_size_mb:.1f} MB")
+            
             if st.button("💾 Modell speichern", type="primary", use_container_width=True):
                 if not _gh_ok():
                     st.error("GitHub nicht konfiguriert.")
                 else:
-                    with st.spinner("Wird auf GitHub gespeichert (kann ~30 Sek. dauern)..."):
-                        ok, err = _save_model_to_github(up_model.read(), up_labels.read())
+                    with st.spinner("Wird auf GitHub gespeichert (kann bis zu 1 Min. dauern)..."):
+                        progress_bar = st.progress(0)
+                        ok, err = _save_model_to_github(up_model.read())
+                        progress_bar.progress(100)
+                    
                     if ok:
                         st.cache_resource.clear()
-                        st.success("✅ Gespeichert! App wird neu geladen...")
+                        st.success("✅ Modell gespeichert! App wird in Kürze neu geladen...")
+                        time.sleep(2)
                         st.rerun()
                     else:
-                        st.error(f"Fehler: {err}")
+                        st.error(f"❌ Fehler beim Speichern:\n\n`{err}`")
+                        st.info("💡 **Tipps zur Behebung:**\n"
+                               "- Prüfe deine Internetverbindung\n"
+                               "- Stelle sicher, dass der GitHub Token gültig ist\n"
+                               "- Versuche das Modell erneut hochzuladen (Retry)")
 
     st.markdown("---")
     if st.button("🔄 Neu laden", use_container_width=True):
@@ -368,9 +405,9 @@ with st.sidebar:
 
 page = st.session_state.page
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # PAGE: MONITOR
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 if page == "monitor":
     st.markdown('<div class="section-title">📺 Monitor</div>', unsafe_allow_html=True)
 
@@ -483,9 +520,9 @@ if page == "monitor":
             st.session_state.detail_cam = None
             st.rerun()
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # PAGE: KAMERAS VERWALTEN
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 elif page == "cameras":
     st.markdown('<div class="section-title">📷 Kameras verwalten</div>', unsafe_allow_html=True)
 
@@ -519,7 +556,9 @@ elif page == "cameras":
                 }
                 if _gh_ok():
                     with st.spinner("Wird auf GitHub gespeichert..."):
-                        save_cameras(st.session_state.cameras)
+                        ok, err = save_cameras(st.session_state.cameras)
+                        if not ok:
+                            st.error(f"Fehler beim Speichern: {err}")
                 st.success(f"✅ Kamera **{new_name}** hinzugefügt!")
                 st.rerun()
 
@@ -543,11 +582,11 @@ elif page == "cameras":
             if st.button("📤 Hochladen & speichern", type="primary"):
                 if _gh_ok():
                     with st.spinner("Wird auf GitHub gespeichert..."):
-                        ok = save_image(sel_id, img_to_bytes(img))
+                        ok, err = save_image(sel_id, img_to_bytes(img))
                     if ok:
                         st.success("✅ Bild gespeichert!")
                     else:
-                        st.error("Fehler beim Speichern auf GitHub.")
+                        st.error(f"Fehler beim Speichern: {err}")
                 else:
                     st.warning("GitHub nicht konfiguriert — Speichern nicht möglich.")
 
@@ -641,9 +680,9 @@ Bild direkt über die App hochladen (oben auf dieser Seite).
                         save_cameras(st.session_state.cameras)
                     st.rerun()
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # PAGE: TEST UPLOAD
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 elif page == "test":
     st.markdown('<div class="section-title">🧪 Test-Upload</div>', unsafe_allow_html=True)
     st.markdown("Lade ein Bild hoch um zu prüfen, ob das Modell es korrekt einschätzt — ohne dass eine echte Kamera verbunden sein muss.")
@@ -693,11 +732,11 @@ elif page == "test":
                 sel = st.selectbox("Kamera wählen", list(cam_opts.keys()), key="test_cam_sel")
                 if st.button("💾 Als letztes Bild dieser Kamera speichern"):
                     with st.spinner("Speichere..."):
-                        ok = save_image(cam_opts[sel], img_to_bytes(img))
+                        ok, err = save_image(cam_opts[sel], img_to_bytes(img))
                     if ok:
                         st.success(f"✅ Gespeichert für **{sel}**")
                     else:
-                        st.error("Fehler beim Speichern.")
+                        st.error(f"Fehler beim Speichern: {err}")
             elif not cameras:
                 st.caption("Erst unter **Kameras verwalten** eine Kamera anlegen.")
             else:
