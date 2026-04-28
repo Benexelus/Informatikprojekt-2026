@@ -8,7 +8,78 @@ import tempfile
 from PIL import Image, ImageOps
 from datetime import datetime
 from io import BytesIO
+from tqdm import tqdm
 
+# ─── Google Drive Download Helper ───────────────────────────────────────────
+def download_file_from_google_drive(file_id, destination):
+    """
+    Lädt Dateien direkt von Google Drive herunter.
+    Args:
+        file_id: Google Drive File ID (z.B. aus dem Freigabe-Link)
+        destination: Lokaler Speicherpfad (z.B. "model.h5")
+    """
+    URL = f"https://drive.google.com/uc?export=download&id={file_id}"
+    
+    session = requests.Session()
+    response = session.get(URL, stream=True)
+    
+    # Bestätigung für große Dateien
+    token = None
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            token = value
+    
+    if token:
+        params = {'id': file_id, 'confirm': token}
+        response = session.get(URL, params=params, stream=True)
+    
+    # Speichern mit Fortschrittsbalken
+    total_size = int(response.headers.get('content-length', 0))
+    block_size = 1024 * 1024  # 1 MB Chunks
+    
+    with open(destination, 'wb') as f:
+        for data in tqdm(response.iter_content(block_size),
+                        total=total_size//block_size,
+                        unit='MB',
+                        unit_scale=True,
+                        desc=f"Download {destination}"):
+            f.write(data)
+
+# ─── Model Download URLs ────────────────────────────────────────────────────
+# DEINE GOOGLE DRIVE LINKS (direkte Download-Links):
+MODEL_URL = "https://drive.google.com/uc?export=download&id=1jBYneWljzJaLyE-11rTaPDVDk8bTV_BY"
+LABELS_URL = "https://drive.google.com/uc?export=download&id=1dmJKuJ1JGb3C02vvAqlT12W7gZc8imip"
+
+# ─── Model Initialisierung ──────────────────────────────────────────────────
+def ensure_model_files():
+    """
+    Stellt sicher, dass Modell und Label-Dateien vorhanden sind.
+    Falls nicht, werden sie heruntergeladen.
+    """
+    os.makedirs("model", exist_ok=True)
+    
+    # Dateipfade
+    MODEL_PATH = "model/keras_model.h5"
+    LABELS_PATH = "model/labels.txt"
+    
+    # Modell herunterladen (falls nicht vorhanden)
+    if not os.path.exists(MODEL_PATH):
+        try:
+            download_file_from_google_drive(MODEL_URL.split('id=')[1], MODEL_PATH)
+        except Exception as e:
+            print(f"Modell-Download fehlgeschlagen: {str(e)}")
+            return False
+    
+    # Labels herunterladen (falls nicht vorhanden)
+    if not os.path.exists(LABELS_PATH):
+        try:
+            download_file_from_google_drive(LABELS_URL.split('id=')[1], LABELS_PATH)
+        except Exception as e:
+            print(f"Label-Download fehlgeschlagen: {str(e)}")
+            return False
+    
+    return True
+    
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Trash Monitor",
