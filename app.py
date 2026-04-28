@@ -140,43 +140,53 @@ def load_image(cam_id: str) -> Image.Image | None:
 # ── Model ─────────────────────────────────────────────────────────────────────
 np.set_printoptions(suppress=True)
 
-def _find_model_path():
-    """Sucht keras_model.h5 über relative UND absolute Pfade."""
-    base = os.path.dirname(os.path.abspath(__file__))
-    for root in [base, os.getcwd()]:
-        m = os.path.join(root, "model", "keras_model.h5")
-        l = os.path.join(root, "model", "labels.txt")
-        if os.path.exists(m) and os.path.exists(l):
-            return m, l
-    return None, None
+def _save_model_to_github(model_bytes: bytes, labels_bytes: bytes) -> bool:
+    """Speichert Modell und Labels auf GitHub."""
+    ok1 = gh_put("model/keras_model.h5", model_bytes, gh_get("model/keras_model.h5")[1], "Upload keras_model.h5")
+    ok2 = gh_put("model/labels.txt",     labels_bytes, gh_get("model/labels.txt")[1],     "Upload labels.txt")
+    return ok1 and ok2
 
 @st.cache_resource
-def _load_tf_model(model_path: str):
-    """TF-Modell wird NUR gecached wenn ein echter Pfad übergeben wird — nie None."""
+def _load_tf_from_bytes(model_bytes: bytes):
+    """Lädt TF-Modell direkt aus Bytes — umgeht korrupte lokale Dateien."""
     import tensorflow as tf
-    return tf.keras.models.load_model(model_path, compile=False)
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+        tmp.write(model_bytes)
+        tmp_path = tmp.name
+    model = tf.keras.models.load_model(tmp_path, compile=False)
+    os.unlink(tmp_path)
+    return model
 
 def load_model():
-    """Kein @st.cache_resource — verhindert dass None eingefroren wird."""
-    model_path, labels_path = _find_model_path()
+    """Lädt Modell von GitHub (Bytes) — kein Cache auf None."""
+    # 1. Versuche von GitHub zu laden
+    if _gh_ok():
+        model_bytes, _ = gh_get("model/keras_model.h5")
+        labels_bytes, _ = gh_get("model/labels.txt")
+        if model_bytes and labels_bytes:
+            try:
+                m   = _load_tf_from_bytes(model_bytes)
+                lbl = labels_bytes.decode("utf-8").splitlines(keepends=True)
+                return m, lbl, None
+            except Exception as e:
+                return None, None, f"TF-Ladefehler (GitHub): `{str(e)}`"
 
-    if not model_path:
-        base  = os.path.dirname(os.path.abspath(__file__))
-        mdir  = os.path.join(base, "model")
-        mdir2 = os.path.join(os.getcwd(), "model")
-        info  = (
-            f"Gesucht in: `{mdir}` und `{mdir2}`  \n"
-            f"Dateien in model/ (abs): `{os.listdir(mdir) if os.path.exists(mdir) else 'Ordner fehlt'}`  \n"
-            f"Dateien in model/ (cwd): `{os.listdir(mdir2) if os.path.exists(mdir2) else 'Ordner fehlt'}`"
-        )
-        return None, None, info
+    # 2. Fallback: lokale Dateien
+    base = os.path.dirname(os.path.abspath(__file__))
+    for root in [base, os.getcwd()]:
+        mp = os.path.join(root, "model", "keras_model.h5")
+        lp = os.path.join(root, "model", "labels.txt")
+        if os.path.exists(mp) and os.path.exists(lp):
+            try:
+                model_bytes = open(mp, "rb").read()
+                m   = _load_tf_from_bytes(model_bytes)
+                lbl = open(lp, "r").readlines()
+                return m, lbl, None
+            except Exception as e:
+                return None, None, f"TF-Ladefehler (lokal): `{str(e)}`"
 
-    try:
-        m   = _load_tf_model(model_path)
-        lbl = open(labels_path, "r").readlines()
-        return m, lbl, None
-    except Exception as e:
-        return None, None, f"TF-Ladefehler: `{str(e)}`"
+    return None, None, "Kein Modell gefunden. Bitte über **Modell hochladen** in der Sidebar hinzufügen."
 
 def predict(model, class_names, img: Image.Image):
     """Exakt der Teachable Machine Predict-Code."""
@@ -255,7 +265,29 @@ with st.sidebar:
             st.caption(f"ℹ️ {_model_err}")
 
     st.markdown("---")
+    st.markdown("**🧠 Modell hochladen**")
+    with st.expander("keras_model.h5 + labels.txt", expanded=not bool(model)):
+        up_model  = st.file_uploader("keras_model.h5", type=["h5"],  key="sb_model")
+        up_labels = st.file_uploader("labels.txt",     type=["txt"], key="sb_labels")
+        if up_model and up_labels:
+            if st.button("💾 Modell speichern", type="primary", use_container_width=True):
+                model_bytes  = up_model.read()
+                labels_bytes = up_labels.read()
+                if _gh_ok():
+                    with st.spinner("Wird auf GitHub gespeichert..."):
+                        ok = _save_model_to_github(model_bytes, labels_bytes)
+                    if ok:
+                        st.cache_resource.clear()
+                        st.success("✅ Gespeichert! App wird neu geladen...")
+                        st.rerun()
+                    else:
+                        st.error("GitHub-Fehler beim Speichern.")
+                else:
+                    st.warning("GitHub nicht konfiguriert — Modell kann nicht dauerhaft gespeichert werden.")
+
+    st.markdown("---")
     if st.button("🔄 Neu laden", use_container_width=True):
+        st.cache_resource.clear()
         if _gh_ok():
             st.session_state.cameras = load_cameras()
         st.rerun()
