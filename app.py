@@ -4,7 +4,8 @@ import os
 import base64
 import requests
 import json
-from PIL import Image
+import tempfile
+from PIL import Image, ImageOps
 from datetime import datetime
 from io import BytesIO
 
@@ -19,7 +20,6 @@ st.set_page_config(
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* Sidebar navigation buttons */
 div[data-testid="stSidebar"] .nav-btn button {
     width: 100%;
     text-align: left;
@@ -36,8 +36,6 @@ div[data-testid="stSidebar"] .nav-btn-active button {
     border-left: 3px solid #ff4b4b !important;
     font-weight: 600;
 }
-
-/* Cards */
 .full-card {
     border: 3px solid #ff4b4b;
     border-radius: 12px;
@@ -71,8 +69,6 @@ div[data-testid="stSidebar"] .nav-btn-active button {
 .status-ok    { color: #28a745; font-weight: 700; font-size: 1rem; }
 .status-none  { color: #888;    font-style: italic; font-size: 0.9rem; }
 .section-title { font-size: 1.4rem; font-weight: 600; margin-bottom: 1rem; }
-
-/* Connection type badge */
 .conn-badge {
     display: inline-block;
     background: #f0f2f6;
@@ -96,22 +92,103 @@ def _gh_headers():
             "Accept": "application/vnd.github.v3+json"}
 
 def gh_get(path):
+    """Kleine Dateien (<1 MB) über Contents-API laden."""
     url = f"https://api.github.com/repos/{_gh_repo()}/contents/{path}?ref={_gh_branch()}"
     r = requests.get(url, headers=_gh_headers(), timeout=10)
     if r.status_code == 200:
         d = r.json()
-        return base64.b64decode(d["content"]), d["sha"]
+        # Wenn die Datei zu groß ist, liefert GitHub kein content-Feld
+        if "content" in d:
+            return base64.b64decode(d["content"]), d.get("sha")
     return None, None
 
-def gh_put(path, data: bytes, sha, msg: str):
+def gh_raw(path) -> bytes | None:
+    """
+    Große Dateien direkt als Raw-Bytes laden.
+    Kein Größenlimit, funktioniert für keras_model.h5.
+    """
+    url = f"https://raw.githubusercontent.com/{_gh_repo()}/{_gh_branch()}/{path}"
+    r = requests.get(url,
+                     headers={"Authorization": f"token {_gh_token()}"},
+                     timeout=120)
+    if r.status_code == 200:
+        return r.content
+    return None
+
+def gh_put_small(path, data: bytes, sha, msg: str) -> bool:
+    """Kleine Dateien (<~50 MB) per Contents-API hochladen."""
     url = f"https://api.github.com/repos/{_gh_repo()}/contents/{path}"
-    payload = {"message": msg,
-               "content": base64.b64encode(data).decode(),
-               "branch": _gh_branch()}
+    payload = {
+        "message": msg,
+        "content": base64.b64encode(data).decode(),
+        "branch": _gh_branch(),
+    }
     if sha:
         payload["sha"] = sha
-    r = requests.put(url, headers=_gh_headers(), json=payload, timeout=15)
+    r = requests.put(url, headers=_gh_headers(), json=payload, timeout=60)
     return r.status_code in (200, 201)
+
+def gh_put_blob(path, data: bytes, msg: str) -> bool:
+    """
+    Große Dateien über Git-Blobs-API hochladen — umgeht das Contents-API-Limit.
+    Ablauf: create blob → get tree SHA → create tree → create commit → update ref
+    """
+    repo  = _gh_repo()
+    branch = _gh_branch()
+    base  = f"https://api.github.com/repos/{repo}"
+    h     = _gh_headers()
+
+    # 1. Blob erstellen
+    r = requests.post(f"{base}/git/blobs", headers=h, json={
+        "content": base64.b64encode(data).decode(),
+        "encoding": "base64"
+    }, timeout=120)
+    if r.status_code not in (200, 201):
+        return False
+    blob_sha = r.json()["sha"]
+
+    # 2. Aktuellen Branch-SHA holen
+    r = requests.get(f"{base}/git/ref/heads/{branch}", headers=h, timeout=10)
+    if r.status_code != 200:
+        return False
+    base_commit_sha = r.json()["object"]["sha"]
+
+    # 3. Aktuellen Tree-SHA holen
+    r = requests.get(f"{base}/git/commits/{base_commit_sha}", headers=h, timeout=10)
+    if r.status_code != 200:
+        return False
+    base_tree_sha = r.json()["tree"]["sha"]
+
+    # 4. Neuen Tree erstellen
+    r = requests.post(f"{base}/git/trees", headers=h, json={
+        "base_tree": base_tree_sha,
+        "tree": [{"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}]
+    }, timeout=30)
+    if r.status_code not in (200, 201):
+        return False
+    new_tree_sha = r.json()["sha"]
+
+    # 5. Commit erstellen
+    r = requests.post(f"{base}/git/commits", headers=h, json={
+        "message": msg,
+        "tree": new_tree_sha,
+        "parents": [base_commit_sha]
+    }, timeout=30)
+    if r.status_code not in (200, 201):
+        return False
+    new_commit_sha = r.json()["sha"]
+
+    # 6. Branch-Ref aktualisieren
+    r = requests.patch(f"{base}/git/refs/heads/{branch}", headers=h, json={
+        "sha": new_commit_sha
+    }, timeout=30)
+    return r.status_code in (200, 201)
+
+def gh_put(path, data: bytes, sha, msg: str) -> bool:
+    """Wählt automatisch die richtige Upload-Methode je nach Dateigröße."""
+    if len(data) > 500_000:  # >500 KB → Blobs-API
+        return gh_put_blob(path, data, msg)
+    return gh_put_small(path, data, sha, msg)
 
 def load_cameras() -> dict:
     content, _ = gh_get("cameras.json")
@@ -121,9 +198,9 @@ def load_cameras() -> dict:
 
 def save_cameras(cameras: dict):
     _, sha = gh_get("cameras.json")
-    gh_put("cameras.json",
-           json.dumps(cameras, indent=2).encode(),
-           sha, "Update camera registry")
+    gh_put_small("cameras.json",
+                 json.dumps(cameras, indent=2).encode(),
+                 sha, "Update camera registry")
 
 def save_image(cam_id: str, img_bytes: bytes):
     path = f"camera_images/{cam_id}/latest.jpg"
@@ -140,75 +217,80 @@ def load_image(cam_id: str) -> Image.Image | None:
 # ── Model ─────────────────────────────────────────────────────────────────────
 np.set_printoptions(suppress=True)
 
-def _save_model_to_github(model_bytes: bytes, labels_bytes: bytes) -> bool:
-    """Speichert Modell und Labels auf GitHub."""
-    ok1 = gh_put("model/keras_model.h5", model_bytes, gh_get("model/keras_model.h5")[1], "Upload keras_model.h5")
-    ok2 = gh_put("model/labels.txt",     labels_bytes, gh_get("model/labels.txt")[1],     "Upload labels.txt")
-    return ok1 and ok2
+def _save_model_to_github(model_bytes: bytes, labels_bytes: bytes) -> tuple[bool, str]:
+    """
+    Speichert Modell (groß) und Labels (klein) auf GitHub.
+    Gibt (erfolg, fehlermeldung) zurück.
+    """
+    # labels.txt — klein, Contents-API reicht
+    _, sha_lbl = gh_get("model/labels.txt")
+    ok_labels = gh_put_small("model/labels.txt", labels_bytes, sha_lbl, "Upload labels.txt")
+    if not ok_labels:
+        return False, "labels.txt konnte nicht gespeichert werden."
 
-@st.cache_resource
-def _load_tf_from_bytes(model_bytes: bytes):
-    """Lädt TF-Modell direkt aus Bytes — umgeht korrupte lokale Dateien."""
-    import tensorflow as tf
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
-        tmp.write(model_bytes)
-        tmp_path = tmp.name
-    model = tf.keras.models.load_model(tmp_path, compile=False)
-    os.unlink(tmp_path)
-    return model
+    # keras_model.h5 — groß, Blobs-API verwenden
+    ok_model = gh_put_blob("model/keras_model.h5", model_bytes, "Upload keras_model.h5")
+    if not ok_model:
+        return False, "keras_model.h5 konnte nicht gespeichert werden (Blobs-API fehlgeschlagen)."
 
+    return True, ""
+
+@st.cache_resource(show_spinner="KI-Modell wird von GitHub geladen…")
 def load_model():
-    """Lädt Modell von GitHub (Bytes) — kein Cache auf None."""
-    # 1. Versuche von GitHub zu laden
-    if _gh_ok():
-        model_bytes, _ = gh_get("model/keras_model.h5")
-        labels_bytes, _ = gh_get("model/labels.txt")
-        if model_bytes and labels_bytes:
-            try:
-                m   = _load_tf_from_bytes(model_bytes)
-                lbl = labels_bytes.decode("utf-8").splitlines(keepends=True)
-                return m, lbl, None
-            except Exception as e:
-                return None, None, f"TF-Ladefehler (GitHub): `{str(e)}`"
+    """
+    Lädt keras_model.h5 via Raw-URL (kein Größenlimit).
+    labels.txt via Raw-URL.
+    Gibt (model, labels, fehler_str) zurück.
+    """
+    if not _gh_ok():
+        return None, None, "GitHub nicht konfiguriert (GITHUB_TOKEN / GITHUB_REPO fehlen)."
 
-    # 2. Fallback: lokale Dateien
-    base = os.path.dirname(os.path.abspath(__file__))
-    for root in [base, os.getcwd()]:
-        mp = os.path.join(root, "model", "keras_model.h5")
-        lp = os.path.join(root, "model", "labels.txt")
-        if os.path.exists(mp) and os.path.exists(lp):
-            try:
-                model_bytes = open(mp, "rb").read()
-                m   = _load_tf_from_bytes(model_bytes)
-                lbl = open(lp, "r").readlines()
-                return m, lbl, None
-            except Exception as e:
-                return None, None, f"TF-Ladefehler (lokal): `{str(e)}`"
+    try:
+        import tensorflow as tf
+    except ImportError:
+        return None, None, "TensorFlow nicht installiert."
 
-    return None, None, "Kein Modell gefunden. Bitte über **Modell hochladen** in der Sidebar hinzufügen."
+    # labels.txt laden
+    labels_bytes = gh_raw("model/labels.txt")
+    if labels_bytes is None:
+        return None, None, (
+            f"`model/labels.txt` nicht gefunden "
+            f"({_gh_repo()} / Branch: {_gh_branch()})."
+        )
+    labels = [l.strip() for l in labels_bytes.decode("utf-8").splitlines() if l.strip()]
+
+    # keras_model.h5 via Raw-URL laden (umgeht 1 MB Limit der Contents-API)
+    model_bytes = gh_raw("model/keras_model.h5")
+    if model_bytes is None:
+        return None, None, (
+            f"`model/keras_model.h5` nicht gefunden "
+            f"({_gh_repo()} / Branch: {_gh_branch()}). "
+            "Bitte über **Modell hochladen** in der Sidebar hochladen."
+        )
+
+    # In temp-Datei schreiben — Keras braucht Dateipfad
+    tmp = tempfile.NamedTemporaryFile(suffix=".h5", delete=False)
+    try:
+        tmp.write(model_bytes)
+        tmp.close()
+        m = tf.keras.models.load_model(tmp.name, compile=False)
+    except Exception as e:
+        return None, None, f"TF-Ladefehler: `{e}`"
+    finally:
+        os.unlink(tmp.name)
+
+    return m, labels, None
 
 def predict(model, class_names, img: Image.Image):
     """Exakt der Teachable Machine Predict-Code."""
-    from PIL import ImageOps
-    # Array vorbereiten — genau wie Teachable Machine
     data = np.ndarray(shape=(1, 224, 224, 3), dtype=np.float32)
-    # Bild auf mindestens 224x224 skalieren, dann mittig croppen
-    image = img.convert("RGB")
-    size = (224, 224)
-    image = ImageOps.fit(image, size, Image.Resampling.LANCZOS)
-    image_array = np.asarray(image)
-    # Normalisierung exakt wie Teachable Machine
-    normalized_image_array = (image_array.astype(np.float32) / 127.5) - 1
-    data[0] = normalized_image_array
-    # Vorhersage
+    image = ImageOps.fit(img.convert("RGB"), (224, 224), Image.Resampling.LANCZOS)
+    data[0] = (np.asarray(image).astype(np.float32) / 127.5) - 1
     prediction = model.predict(data, verbose=0)
-    index = np.argmax(prediction)
-    class_name = class_names[index]
-    confidence_score = float(prediction[0][index])
-    # Label bereinigen: "0 voll" → "voll"
-    clean_label = class_name.strip()[2:] if len(class_name.strip()) > 2 else class_name.strip()
-    return clean_label, confidence_score, prediction[0]
+    index = int(np.argmax(prediction))
+    raw = class_names[index].strip()
+    clean = raw[2:] if len(raw) > 2 and raw[1] == " " else raw
+    return clean, float(prediction[0][index]), prediction[0]
 
 def is_full(label: str) -> bool:
     return "voll" in label.lower() or "full" in label.lower()
@@ -225,20 +307,18 @@ if "cameras" not in st.session_state:
     st.session_state.cameras = load_cameras() if _gh_ok() else {}
 if "detail_cam" not in st.session_state:
     st.session_state.detail_cam = None
-if "add_cam_open" not in st.session_state:
-    st.session_state.add_cam_open = False
 
 model, labels, _model_err = load_model()
 
-# ── Sidebar navigation ────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🗑️ Trash Monitor")
     st.markdown("---")
 
     pages = {
-        "monitor":  "📺  Monitor",
-        "cameras":  "📷  Kameras verwalten",
-        "test":     "🧪  Test-Upload",
+        "monitor": "📺  Monitor",
+        "cameras": "📷  Kameras verwalten",
+        "test":    "🧪  Test-Upload",
     }
     for key, label in pages.items():
         active = st.session_state.page == key
@@ -250,13 +330,8 @@ with st.sidebar:
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
-
-    # Status indicators
     st.markdown("**Status**")
-    if _gh_ok():
-        st.markdown("🟢 GitHub verbunden")
-    else:
-        st.markdown("🔴 GitHub nicht konfiguriert")
+    st.markdown("🟢 GitHub verbunden" if _gh_ok() else "🔴 GitHub nicht konfiguriert")
     if model:
         st.markdown("🟢 KI-Modell geladen")
     else:
@@ -267,23 +342,22 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**🧠 Modell hochladen**")
     with st.expander("keras_model.h5 + labels.txt", expanded=not bool(model)):
+        st.caption("Modell von Teachable Machine hier hochladen — wird automatisch im Repo gespeichert.")
         up_model  = st.file_uploader("keras_model.h5", type=["h5"],  key="sb_model")
         up_labels = st.file_uploader("labels.txt",     type=["txt"], key="sb_labels")
         if up_model and up_labels:
             if st.button("💾 Modell speichern", type="primary", use_container_width=True):
-                model_bytes  = up_model.read()
-                labels_bytes = up_labels.read()
-                if _gh_ok():
-                    with st.spinner("Wird auf GitHub gespeichert..."):
-                        ok = _save_model_to_github(model_bytes, labels_bytes)
+                if not _gh_ok():
+                    st.error("GitHub nicht konfiguriert.")
+                else:
+                    with st.spinner("Wird auf GitHub gespeichert (kann ~30 Sek. dauern)..."):
+                        ok, err = _save_model_to_github(up_model.read(), up_labels.read())
                     if ok:
                         st.cache_resource.clear()
                         st.success("✅ Gespeichert! App wird neu geladen...")
                         st.rerun()
                     else:
-                        st.error("GitHub-Fehler beim Speichern.")
-                else:
-                    st.warning("GitHub nicht konfiguriert — Modell kann nicht dauerhaft gespeichert werden.")
+                        st.error(f"Fehler: {err}")
 
     st.markdown("---")
     if st.button("🔄 Neu laden", use_container_width=True):
@@ -301,15 +375,13 @@ if page == "monitor":
     st.markdown('<div class="section-title">📺 Monitor</div>', unsafe_allow_html=True)
 
     threshold = st.slider("Schwellenwert (Konfidenz)", 0.5, 1.0, 0.75, 0.05,
-                          key="thresh_monitor",
-                          help="Ab wann gilt ein Eimer als voll?")
+                          key="thresh_monitor", help="Ab wann gilt ein Eimer als voll?")
 
     cameras = st.session_state.cameras
     if not cameras:
         st.info("Noch keine Kameras verbunden. Gehe zu **Kameras verwalten**.")
         st.stop()
 
-    # Analyse
     results = []
     with st.spinner("Bilder werden geladen..."):
         for cam_id, info in cameras.items():
@@ -324,13 +396,11 @@ if page == "monitor":
 
     full_cams = [r for r in results if r["full"]]
 
-    # Alert banner + sound
     if full_cams:
         names = " &nbsp;|&nbsp; ".join(["📍 " + r["name"] for r in full_cams])
         st.markdown(
             f'<div class="alert-banner"><h3>🚨 {len(full_cams)} Mülleimer überfüllt!</h3>'
-            f'<p>{names}</p></div>',
-            unsafe_allow_html=True)
+            f'<p>{names}</p></div>', unsafe_allow_html=True)
         st.components.v1.html("""<script>
         try {
             const ctx = new AudioContext();
@@ -346,7 +416,6 @@ if page == "monitor":
         } catch(e) {}
         </script>""", height=0)
 
-    # Überfüllte Eimer — prominent
     if full_cams:
         st.markdown("### 🔴 Überfüllte Eimer")
         cols = st.columns(min(len(full_cams), 3))
@@ -360,7 +429,6 @@ if page == "monitor":
                 st.markdown('</div>', unsafe_allow_html=True)
         st.markdown("---")
 
-    # Alle Kameras
     st.markdown("### 📷 Alle Kameras")
     cols = st.columns(min(len(results), 3))
     for i, r in enumerate(results):
@@ -369,7 +437,6 @@ if page == "monitor":
             st.markdown(f'<div class="{card}">', unsafe_allow_html=True)
             st.markdown(f"**{r['name']}**")
             st.markdown(f'<span class="conn-badge">{r["connection"]}</span>', unsafe_allow_html=True)
-
             if r["img"]:
                 st.image(r["img"], use_column_width=True)
                 if r["label"]:
@@ -378,9 +445,8 @@ if page == "monitor":
                     st.markdown(f'<div class="{cls}">{icon} {r["label"]} ({r["conf"]*100:.1f}%)</div>',
                                 unsafe_allow_html=True)
                 else:
-                    st.markdown(f'<div class="status-none">⚠️ Kein Modell: {_model_err or "unbekannter Fehler"}</div>',
+                    st.markdown(f'<div class="status-none">⚠️ Kein Modell: {_model_err or "?"}</div>',
                                 unsafe_allow_html=True)
-
                 if st.button("🔍 Detail", key=f"detail_{r['id']}"):
                     st.session_state.detail_cam = r["id"]
                     st.rerun()
@@ -389,7 +455,6 @@ if page == "monitor":
                             unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
-    # Detail modal
     if st.session_state.detail_cam:
         cam_id = st.session_state.detail_cam
         info   = cameras.get(cam_id, {})
@@ -407,8 +472,7 @@ if page == "monitor":
                 if model:
                     lbl, conf, _ = predict(model, labels, img)
                     full = is_full(lbl) and conf >= threshold
-                    st.metric("Ergebnis", f"{'🔴' if full else '🟢'} {lbl}",
-                              f"{conf*100:.1f}% Konfidenz")
+                    st.metric("Ergebnis", f"{'🔴' if full else '🟢'} {lbl}", f"{conf*100:.1f}% Konfidenz")
                     if full:
                         st.error("⚠️ Überfüllt — bitte leeren!")
                     else:
@@ -425,10 +489,8 @@ if page == "monitor":
 elif page == "cameras":
     st.markdown('<div class="section-title">📷 Kameras verwalten</div>', unsafe_allow_html=True)
 
-    threshold = st.slider("Schwellenwert (Konfidenz)", 0.5, 1.0, 0.75, 0.05,
-                          key="thresh_cameras")
+    threshold = st.slider("Schwellenwert (Konfidenz)", 0.5, 1.0, 0.75, 0.05, key="thresh_cameras")
 
-    # ── Neue Kamera ───────────────────────────────────────────────────────────
     with st.expander("➕ Neue Kamera hinzufügen", expanded=True):
         c1, c2 = st.columns(2)
         with c1:
@@ -437,15 +499,10 @@ elif page == "cameras":
                                      placeholder="z.B. cam_rathaus")
         with c2:
             conn_type = st.selectbox("Verbindungstyp", [
-                "Raspberry Pi (HTTP)",
-                "PC / Laptop (lokal)",
-                "ESP32-CAM (LTE / WLAN)",
-                "Smartphone (Termux)",
-                "Bluetooth Relay",
-                "Manueller Upload",
+                "Raspberry Pi (HTTP)", "PC / Laptop (lokal)", "ESP32-CAM (LTE / WLAN)",
+                "Smartphone (Termux)", "Bluetooth Relay", "Manueller Upload",
             ])
-            conn_note = st.text_input("Zusatzinfo (optional)",
-                                      placeholder="z.B. IP-Adresse, Standort")
+            conn_note = st.text_input("Zusatzinfo (optional)", placeholder="z.B. IP-Adresse, Standort")
 
         if st.button("✅ Kamera hinzufügen", type="primary"):
             if not new_name or not new_id:
@@ -466,7 +523,6 @@ elif page == "cameras":
                 st.success(f"✅ Kamera **{new_name}** hinzugefügt!")
                 st.rerun()
 
-    # ── Bild manuell hochladen ────────────────────────────────────────────────
     if st.session_state.cameras:
         st.markdown("---")
         st.markdown("### 📤 Bild für Kamera hochladen")
@@ -475,19 +531,15 @@ elif page == "cameras":
         cam_opts = {v["name"]: k for k, v in st.session_state.cameras.items()}
         sel_name = st.selectbox("Kamera wählen", list(cam_opts.keys()), key="upload_cam_select")
         sel_id   = cam_opts[sel_name]
-        up_file  = st.file_uploader("Bild auswählen", type=["jpg", "jpeg", "png"],
-                                    key="cam_upload")
+        up_file  = st.file_uploader("Bild auswählen", type=["jpg", "jpeg", "png"], key="cam_upload")
 
         if up_file:
             img = Image.open(up_file)
             st.image(img, width=300)
-
             if model:
                 lbl, conf, _ = predict(model, labels, img)
                 full = is_full(lbl) and conf >= threshold
-                st.metric("KI-Vorschau", f"{'🔴' if full else '🟢'} {lbl}",
-                          f"{conf*100:.1f}%")
-
+                st.metric("KI-Vorschau", f"{'🔴' if full else '🟢'} {lbl}", f"{conf*100:.1f}%")
             if st.button("📤 Hochladen & speichern", type="primary"):
                 if _gh_ok():
                     with st.spinner("Wird auf GitHub gespeichert..."):
@@ -499,7 +551,6 @@ elif page == "cameras":
                 else:
                     st.warning("GitHub nicht konfiguriert — Speichern nicht möglich.")
 
-    # ── Verbindungsanleitung ──────────────────────────────────────────────────
     st.markdown("---")
     with st.expander("📡 Verbindungsanleitung — wie schicke ich Bilder an die App?"):
         st.markdown("""
@@ -515,8 +566,8 @@ import cv2, requests, base64, time
 
 GITHUB_TOKEN = "ghp_DEIN_TOKEN"
 GITHUB_REPO  = "username/trash-monitor"
-CAM_ID       = "cam_1"      # muss mit der ID in der App übereinstimmen
-INTERVAL     = 900          # Sekunden (900 = 15 Minuten)
+CAM_ID       = "cam_1"
+INTERVAL     = 900
 
 def push(img_bytes):
     path = f"camera_images/{CAM_ID}/latest.jpg"
@@ -548,10 +599,7 @@ ESP32-CAM sendet per HTTP POST an einen kleinen Relay-Server, der dann auf GitHu
 ---
 
 ### Option 3 — Smartphone (Termux / Android)
-Termux installieren → Python installieren → obiges Skript mit der Handykamera nutzen.
-
 ```bash
-# In Termux:
 pkg install python
 pip install requests opencv-python
 python capture.py
@@ -560,15 +608,14 @@ python capture.py
 ---
 
 ### Option 4 — Bluetooth Relay
-Kamera sendet per Bluetooth an einen Raspberry Pi in der Nähe, der dann per WLAN auf GitHub pusht.
+Kamera → Bluetooth → Raspberry Pi → WLAN → GitHub
 
 ---
 
 ### Option 5 — Manueller Upload
-Kein Skript nötig — Bild direkt über die App hochladen (oben auf dieser Seite).
+Bild direkt über die App hochladen (oben auf dieser Seite).
         """)
 
-    # ── Bestehende Kameras ────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("### Verbundene Kameras")
     cameras = st.session_state.cameras
@@ -583,7 +630,6 @@ Kein Skript nötig — Bild direkt über die App hochladen (oben auf dieser Seit
                 st.markdown(f'<span class="conn-badge">{info.get("connection","")}</span>',
                             unsafe_allow_html=True)
             with c3:
-                # Show last image
                 if st.button("🖼 Bild", key=f"show_{cam_id}"):
                     st.session_state.detail_cam = cam_id
                     st.session_state.page = "monitor"
@@ -602,9 +648,7 @@ elif page == "test":
     st.markdown('<div class="section-title">🧪 Test-Upload</div>', unsafe_allow_html=True)
     st.markdown("Lade ein Bild hoch um zu prüfen, ob das Modell es korrekt einschätzt — ohne dass eine echte Kamera verbunden sein muss.")
 
-    threshold = st.slider("Schwellenwert (Konfidenz)", 0.5, 1.0, 0.75, 0.05,
-                          key="thresh_test")
-
+    threshold = st.slider("Schwellenwert (Konfidenz)", 0.5, 1.0, 0.75, 0.05, key="thresh_test")
     st.markdown("---")
 
     uploaded = st.file_uploader("📁 Bild hochladen (JPG / PNG)", type=["jpg", "jpeg", "png"])
@@ -626,8 +670,6 @@ elif page == "test":
 
                 icon = "🔴" if full else "🟢"
                 st.metric("Ergebnis", f"{icon} {lbl}", f"{conf*100:.1f}% Konfidenz")
-
-                # Confidence bar
                 st.progress(conf)
 
                 if full:
@@ -635,18 +677,15 @@ elif page == "test":
                 else:
                     st.success("✅ **Nicht überfüllt** — Alles in Ordnung.")
 
-                # All class probabilities — direkt aus predict(), kein zweiter model.predict() nötig
                 st.markdown("**Alle Klassen:**")
                 for i, lbl_name in enumerate(labels):
-                    clean = lbl_name.strip()[2:] if len(lbl_name.strip()) > 2 else lbl_name.strip()
+                    raw = lbl_name.strip()
+                    clean = raw[2:] if len(raw) > 2 and raw[1] == " " else raw
                     st.progress(float(all_preds[i]), text=f"{clean}: {all_preds[i]*100:.1f}%")
-
             else:
                 st.warning(f"⚠️ Kein KI-Modell gefunden.  \n{_model_err or ''}")
 
             st.markdown("---")
-
-            # Optionally save to a camera
             st.markdown("**Optional: Als Kamera-Bild speichern**")
             cameras = st.session_state.cameras
             if cameras and _gh_ok():
@@ -664,7 +703,6 @@ elif page == "test":
             else:
                 st.caption("GitHub nicht konfiguriert — Speichern nicht möglich.")
     else:
-        # Tips when nothing uploaded yet
         st.markdown("### 💡 Tipps für gute Testergebnisse")
         st.markdown("""
 - Fotografiere den Mülleimer **aus der gleichen Perspektive** wie die echte Kamera
