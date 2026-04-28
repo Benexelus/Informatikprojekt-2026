@@ -138,54 +138,45 @@ def load_image(cam_id: str) -> Image.Image | None:
     return None
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-# ── Model ─────────────────────────────────────────────────────────────────────
 np.set_printoptions(suppress=True)
 
 def _find_model_path():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    model_dir = os.path.join(base_dir, "model")
-
-    # DEBUG INFOS
-    debug_info = {
-        "base_dir": base_dir,
-        "model_dir": model_dir,
-        "model_dir_exists": os.path.exists(model_dir),
-        "files_in_base": os.listdir(base_dir) if os.path.exists(base_dir) else [],
-        "files_in_model": os.listdir(model_dir) if os.path.exists(model_dir) else []
-    }
-
-    if not os.path.exists(model_dir):
-        return None, None, "Ordner 'model/' nicht gefunden", debug_info
-
-    model_path = os.path.join(model_dir, "keras_model.h5")
-    if not os.path.exists(model_path):
-        return None, None, "keras_model.h5 fehlt", debug_info
-
-    labels_path = os.path.join(model_dir, "labels.txt")
-    if not os.path.exists(labels_path):
-        return None, None, "labels.txt fehlt", debug_info
-
-    return model_path, labels_path, None, debug_info
-
+    """Sucht keras_model.h5 über relative UND absolute Pfade."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    for root in [base, os.getcwd()]:
+        m = os.path.join(root, "model", "keras_model.h5")
+        l = os.path.join(root, "model", "labels.txt")
+        if os.path.exists(m) and os.path.exists(l):
+            return m, l
+    return None, None
 
 @st.cache_resource
-def load_model():
-    model_path, labels_path, err, debug_info = _find_model_path()
+def _load_tf_model(model_path: str):
+    """TF-Modell wird NUR gecached wenn ein echter Pfad übergeben wird — nie None."""
+    import tensorflow as tf
+    return tf.keras.models.load_model(model_path, compile=False)
 
-    if err:
-        return None, None, err, debug_info
+def load_model():
+    """Kein @st.cache_resource — verhindert dass None eingefroren wird."""
+    model_path, labels_path = _find_model_path()
+
+    if not model_path:
+        base  = os.path.dirname(os.path.abspath(__file__))
+        mdir  = os.path.join(base, "model")
+        mdir2 = os.path.join(os.getcwd(), "model")
+        info  = (
+            f"Gesucht in: `{mdir}` und `{mdir2}`  \n"
+            f"Dateien in model/ (abs): `{os.listdir(mdir) if os.path.exists(mdir) else 'Ordner fehlt'}`  \n"
+            f"Dateien in model/ (cwd): `{os.listdir(mdir2) if os.path.exists(mdir2) else 'Ordner fehlt'}`"
+        )
+        return None, None, info
 
     try:
-        import tensorflow as tf
-        model = tf.keras.models.load_model(model_path, compile=False)
-
-        with open(labels_path, "r") as f:
-            labels = f.readlines()
-
-        return model, labels, None, debug_info
-
+        m   = _load_tf_model(model_path)
+        lbl = open(labels_path, "r").readlines()
+        return m, lbl, None
     except Exception as e:
-        return None, None, f"Laden fehlgeschlagen: {str(e)}", debug_info
+        return None, None, f"TF-Ladefehler: `{str(e)}`"
 
 def predict(model, class_names, img: Image.Image):
     """Exakt der Teachable Machine Predict-Code."""
@@ -227,7 +218,7 @@ if "detail_cam" not in st.session_state:
 if "add_cam_open" not in st.session_state:
     st.session_state.add_cam_open = False
 
-model, labels, _model_err, _model_debug = load_model()
+model, labels, _model_err = load_model()
 
 # ── Sidebar navigation ────────────────────────────────────────────────────────
 with st.sidebar:
